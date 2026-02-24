@@ -326,6 +326,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
             cu_seqlens_t=jd.num_candidates_offsets if use_kvcache else None,
             scaling_seqlen=jd.scaling_seqlen,
         )
+        # print("kv_cache_table:", kv_cache_table.shape if use_kvcache else None)
+
+        # import pdb; pdb.set_trace()
 
         jagged_attn_output = jagged_attn_output.view(
             -1, self._num_heads * self._linear_dim_per_head

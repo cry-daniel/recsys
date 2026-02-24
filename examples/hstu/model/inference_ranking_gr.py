@@ -20,6 +20,9 @@ from configs import InferenceHSTUConfig, KVCacheConfig, RankingConfig
 from dataset.utils import Batch
 from modules.inference_dense_module import InferenceDenseModule
 from modules.inference_embedding import InferenceEmbedding
+from commons.utils.gpu_timer import IGPUTimer
+import nvtx
+import torch.cuda.profiler as profiler
 
 
 class InferenceRankingGR(torch.nn.Module):
@@ -39,6 +42,7 @@ class InferenceRankingGR(torch.nn.Module):
         super().__init__()
         self.sparse_module = sparse_module
         self.dense_module = dense_module
+        self.igpu_timer = IGPUTimer()
 
     def bfloat16(self):
         """
@@ -81,6 +85,11 @@ class InferenceRankingGR(torch.nn.Module):
         self.sparse_module.load_checkpoint(checkpoint_dir, model_state_dict)
         self.dense_module.load_state_dict(model_state_dict, strict=False)
 
+    def clear_kv_cache(
+        self,
+    ):
+        return self.dense_module.clear_kv_cache()
+
     def get_user_kvdata_info(
         self,
         user_ids: Union[List[int], torch.Tensor],
@@ -96,13 +105,29 @@ class InferenceRankingGR(torch.nn.Module):
         user_start_pos: torch.Tensor = None,
     ):
         with torch.inference_mode():
-            user_start_pos_cuda, kvcache_metadata = self.dense_module.kvcache_prelogue(
-                batch, user_ids, user_start_pos
-            )
-            embeddings = self.sparse_module(batch.features)
-            logits = self.dense_module(
-                batch, embeddings, user_ids, user_start_pos_cuda, kvcache_metadata
-            )
+            # profiler.start()
+            # self.igpu_timer.start()
+            with nvtx.annotate("KV_Cache_Preprocessing", color="blue"):
+                user_start_pos_cuda, kvcache_metadata = self.dense_module.kvcache_prelogue(
+                    batch, user_ids, user_start_pos
+                )
+            # self.igpu_timer.stop()
+            # kv_cache_time = self.igpu_timer.elapsed_time()
+            # self.igpu_timer.start()
+            with nvtx.annotate("Embedding", color="green"):
+                embeddings = self.sparse_module(batch.features)
+            # self.igpu_timer.stop()
+            # embedding_time = self.igpu_timer.elapsed_time()
+            # self.igpu_timer.start()
+            with nvtx.annotate("GR_forward", color="red"):
+                logits = self.dense_module(
+                    batch, embeddings, user_ids, user_start_pos_cuda, kvcache_metadata
+                )
+            # self.igpu_timer.stop()
+            # dense_time = self.igpu_timer.elapsed_time()
+            # print("----------------------------------------")
+            # print(f"KV Cache Time: {kv_cache_time} ms, embedding Time: {embedding_time} ms, dense Time: {dense_time} ms")
+            # profiler.stop()
 
         return logits
 
@@ -115,10 +140,13 @@ def get_inference_ranking_gr(
     cudagraph_configs=None,
     sparse_shareables=None,
 ):
+    # for ebc_config in task_config.embedding_configs:
+    #     assert (
+    #         ebc_config.dim == hstu_config.hidden_size
+    #     ), "hstu layer hidden size should equal to embedding dim"
+
     for ebc_config in task_config.embedding_configs:
-        assert (
-            ebc_config.dim == hstu_config.hidden_size
-        ), "hstu layer hidden size should equal to embedding dim"
+        embedding_dim = ebc_config.dim
 
     inference_sparse = InferenceEmbedding(
         task_config.embedding_configs,

@@ -38,7 +38,9 @@ from utils import DatasetArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
-
+import torch.distributed as dist
+from commons.utils.gpu_timer import IGPUTimer
+import pdb
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
@@ -186,7 +188,7 @@ def get_inference_hstu_model(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config if use_kvcache else None,
         task_config=task_config,
-        use_cudagraph=True,
+        use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
     )
     if hstu_config.bf16:
@@ -216,7 +218,8 @@ def run_ranking_gr_simulate(
     )
 
     max_batch_size = 1
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    # total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    total_max_seqlen = 131072 * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
     with torch.inference_mode():
@@ -252,18 +255,26 @@ def run_ranking_gr_simulate(
             date_name="date",
             sequence_endptr_name="interval_indptr",
             timestamp_names=["date", "interval_end_ts"],
+            # user_id = 879 has more than 70k history length
+            selected_user_id=879,
         )
 
         dataloader = get_data_loader(dataset=dataset)
         dataloader_iter = iter(dataloader)
 
+        print(f"Dataloader size: {len(dataloader)}")
+        igpu_timer = IGPUTimer()
+
+        last_seq_endptr = torch.tensor([0])
+        last_kv_cache_len = torch.tensor([0])
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
-                if dates[0] != cur_date:
+                # pdb.set_trace()
+                if dates[0] != cur_date and False:
                     if cur_date is not None:
                         eval_metric_dict = eval_module.compute()
                         print(
@@ -274,15 +285,27 @@ def run_ranking_gr_simulate(
                         )
                     model.clear_kv_cache()
                     cur_date = dates[0]
+
                 cached_start_pos, cached_len = model.get_user_kvdata_info(
                     uids, dbg_print=True
                 )
+
+                if dates[0] != cur_date:
+                    cur_date = dates[0]
+                    last_seq_endptr = torch.tensor([0])
+                    last_kv_cache_len = cached_len
+
                 new_cache_start_pos = cached_start_pos + cached_len
                 non_contextual_mask = new_cache_start_pos >= num_contextual_features
                 contextual_mask = torch.logical_not(non_contextual_mask)
-                seq_startptrs = (
-                    torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
-                ).int()
+                # seq_startptrs = (
+                #     torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                # ).int()
+                seq_startptrs = last_seq_endptr
+                last_seq_endptr = seq_endptrs
+
+                igpu_timer.reset()
+                igpu_timer.start()
 
                 batch_0 = dataset.get_input_batch(
                     uids[non_contextual_mask],
@@ -291,6 +314,7 @@ def run_ranking_gr_simulate(
                     seq_startptrs[non_contextual_mask],
                     with_contextual_features=False,
                     with_ranking_labels=True,
+                    kv_offset=0,
                 )
                 if batch_0 is not None:
                     logits = model.forward(
@@ -307,6 +331,7 @@ def run_ranking_gr_simulate(
                     seq_startptrs[contextual_mask],
                     with_contextual_features=True,
                     with_ranking_labels=True,
+                    kv_offset=0,
                 )
                 if batch_1 is not None:
                     logits = model.forward(
@@ -317,6 +342,10 @@ def run_ranking_gr_simulate(
                     eval_module(logits, batch_1.labels)
 
                 num_batches_ctr += 1
+                igpu_timer.stop()
+
+                print(f"uids: {uids}, dates: {dates}, seq_startptrs:{seq_startptrs} seq_endptrs: {seq_endptrs}, cached_start_pos: {cached_start_pos}, cached_len: {cached_len}, elapsed time(ms): {igpu_timer.elapsed_time():.3f}")
+
             except StopIteration:
                 break
         end_time = time.time()
@@ -372,6 +401,10 @@ def run_ranking_gr_evaluate(
 
     with torch.inference_mode():
         use_kvcache = not disable_kvcache
+        if use_kvcache:
+            print('Using KV Cache for evaluation.')
+        else:
+            print('Not using KV Cache for evaluation.')
         model = get_inference_hstu_model(
             emb_configs,
             max_batch_size,
@@ -403,6 +436,8 @@ def run_ranking_gr_evaluate(
 
         dataloader = get_data_loader(dataset=eval_dataset)
         dataloader_iter = iter(dataloader)
+
+        print(f"Dataloader size: {len(dataloader)}")
 
         while True:
             try:
@@ -446,6 +481,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
 
+    # single card inference
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            world_size=1,
+            rank=0
+        )
+
     if args.mode == RunningMode.EVAL:
         if args.disable_auc:
             print("disable_auc is ignored in Eval mode.")
@@ -456,7 +499,7 @@ if __name__ == "__main__":
         )
     elif args.mode == RunningMode.SIMULATE:
         if args.disable_kvcache:
-            print("disable_kvcache is ignored in Eval mode.")
+            print("disable_kvcache is ignored in Simulate mode.")
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,

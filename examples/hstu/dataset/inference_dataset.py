@@ -97,6 +97,7 @@ class InferenceDataset(IterableDataset[Batch]):
         random_seed: int = 0,
         seq_nrows: Optional[int] = None,
         batch_nrows: Optional[int] = None,
+        selected_user_id: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._device = torch.cuda.current_device()
@@ -111,6 +112,11 @@ class InferenceDataset(IterableDataset[Batch]):
             self._batch_logs_frame = pd.read_csv(
                 batch_logs_file, delimiter=",", nrows=batch_nrows
             )
+        if selected_user_id is not None:
+            self._seq_logs_frame = self._seq_logs_frame[self._seq_logs_frame[userid_name] == selected_user_id]
+            self._batch_logs_frame = self._batch_logs_frame[self._batch_logs_frame[userid_name] == selected_user_id]
+
+        # import pdb; pdb.set_trace()
 
         self._batch_logs_frame.sort_values(by=timestamp_names, inplace=True)
         len(self._batch_logs_frame)
@@ -176,6 +182,7 @@ class InferenceDataset(IterableDataset[Batch]):
         sequence_startptrs,
         with_contextual_features=False,
         with_ranking_labels=False,
+        kv_offset = 0,
     ):
         contextual_features: Dict[str, List[int]] = defaultdict(list)
         contextual_features_seqlen: Dict[str, List[int]] = defaultdict(list)
@@ -197,6 +204,11 @@ class InferenceDataset(IterableDataset[Batch]):
             date = dates[idx].item()
             end_pos = sequence_endptrs[idx].item()  # history_end_pos
             start_pos = sequence_startptrs[idx].item()
+
+            if end_pos != None:
+                end_pos += kv_offset
+            if start_pos != None:
+                start_pos += kv_offset
 
             data = self._seq_logs_frame[
                 (self._seq_logs_frame[self._userid_name] == uid)
@@ -316,6 +328,9 @@ class InferenceDataset(IterableDataset[Batch]):
             if self._max_num_candidates > 0
             else None,
         )
+
+        # import pdb; pdb.set_trace()
+
         if with_ranking_labels:
             return RankingBatch(labels=labels, **batch_kwargs)
 

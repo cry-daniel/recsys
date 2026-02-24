@@ -196,6 +196,7 @@ def get_inference_hstu_config(
     contextual_max_seqlen: int = 0,
     scaling_seqlen: int = -1,
     embedding_backend=None,
+    hstu_preprocessing_item_emb = None,
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -238,6 +239,7 @@ def get_inference_hstu_config(
         contextual_max_seqlen=contextual_max_seqlen,
         scaling_seqlen=scaling_seqlen,
         embedding_backend=embedding_backend,
+        hstu_preprocessing_config=HSTUPreprocessingConfig(item_embedding_dim=hstu_preprocessing_item_emb, contextual_embedding_dim=hstu_preprocessing_item_emb) if hstu_preprocessing_item_emb is not None else None,
     )
 
 

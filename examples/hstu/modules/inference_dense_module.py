@@ -125,10 +125,10 @@ class InferenceDenseModule(torch.nn.Module):
         self._task_config = task_config
 
         self._embedding_dim = hstu_config.hidden_size
-        for ebc_config in task_config.embedding_configs:
-            assert (
-                ebc_config.dim == self._embedding_dim
-            ), "hstu layer hidden size should equal to embedding dim"
+        # for ebc_config in task_config.embedding_configs:
+        #     assert (
+        #         ebc_config.dim == self._embedding_dim
+        #     ), "hstu layer hidden size should equal to embedding dim"
 
         self._use_kvcache = False
         if kvcache_config is not None:
@@ -321,6 +321,8 @@ class InferenceDenseModule(torch.nn.Module):
             cached_start_pos,
             cached_lengths,
         ) = self._gpu_kv_cache_manager.get_batch_kvdata_info(user_ids)
+
+        # print(f"new_history_lengths: {new_history_lengths}")
 
         self._gpu_kv_cache_manager.allocate(
             user_ids, user_start_pos, new_history_lengths

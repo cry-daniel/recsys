@@ -1,9 +1,11 @@
 TrainerArgs.train_batch_size = 8
 TrainerArgs.eval_batch_size = 8
-TrainerArgs.log_interval = 10
-TrainerArgs.eval_interval = 10
-TrainerArgs.log_interval = 10
+TrainerArgs.log_interval = 50
+TrainerArgs.eval_interval = 50
+TrainerArgs.log_interval = 50
 TrainerArgs.max_train_iters = 550
+TrainerArgs.ckpt_save_interval = 550
+TrainerArgs.ckpt_save_dir = "./ckpts"
 
 DatasetArgs.dataset_name = 'kuairand-1k'
 DatasetArgs.max_sequence_length = 4096

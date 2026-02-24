@@ -26,11 +26,15 @@ from dataset.utils import FeatureConfig
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
+import argparse
 
 
-def run_ranking_gr_inference():
+def run_ranking_gr_inference(
+        batch_size = 8,
+        num_candidates = 256,
+):
     max_batch_size = 16
-    max_seqlen = 4096
+    max_seqlen = 8192
     max_num_candidates = 256
     max_incremental_seqlen = 128
 
@@ -60,6 +64,9 @@ def run_ranking_gr_inference():
         "length_per_sequence": [i * 256 for i in range(2, 18)],
     }
 
+    # 0.5 MB in bfloat16
+    emb_size = 262144
+
     hstu_config = get_inference_hstu_config(
         hidden_size=hidden_dim_size,
         num_layers=num_layers,
@@ -68,9 +75,10 @@ def run_ranking_gr_inference():
         max_batch_size=max_batch_size,
         max_seq_len=total_max_seqlen,
         dtype=inference_dtype,
+        hstu_preprocessing_item_emb=emb_size
     )
 
-    _blocks_in_primary_pool = 10240
+    _blocks_in_primary_pool = 20480
     _page_size = 32
     _offload_chunksize = 8192
     kv_cache_config = get_kvcache_config(
@@ -78,6 +86,7 @@ def run_ranking_gr_inference():
         page_size=_page_size,
         offload_chunksize=_offload_chunksize,
     )
+
     emb_configs = [
         InferenceEmbeddingConfig(
             feature_names=["context_feat", "item_feat"]
@@ -85,14 +94,14 @@ def run_ranking_gr_inference():
             else ["item_feat"],
             table_name="item",
             vocab_size=item_vocab_size,
-            dim=hidden_dim_size,
+            dim=emb_size,
             use_dynamicemb=True,
         ),
         InferenceEmbeddingConfig(
             feature_names=["act_feat"],
             table_name="act",
             vocab_size=action_vocab_size,
-            dim=hidden_dim_size,
+            dim=emb_size,
             use_dynamicemb=False,
         ),
     ]
@@ -108,7 +117,7 @@ def run_ranking_gr_inference():
             hstu_config=hstu_config,
             kvcache_config=kv_cache_config,
             task_config=task_config,
-            use_cudagraph=True,
+            use_cudagraph=False,
             cudagraph_configs=hstu_cudagraph_configs,
         )
         model_predict.bfloat16()
@@ -120,40 +129,44 @@ def run_ranking_gr_inference():
             contextual_feature_names=[],
             action_feature_name=action_fea_name,
             max_num_users=16,
-            max_batch_size=8,  # test batch size
-            max_seqlen=2304,
-            max_num_candidates=max_num_candidates,
+            max_batch_size=batch_size,  # test batch size
+            max_seqlen=65536,
+            max_num_candidates=num_candidates,
             max_incremental_seqlen=max_incremental_seqlen,
             full_mode=True,
         )
 
-        num_warmup_batches = 16
-        for idx in range(num_warmup_batches):
-            uids = data_generator.get_inference_batch_user_ids()
+        # num_warmup_batches = 16
+        # for idx in range(num_warmup_batches):
+        #     uids = data_generator.get_inference_batch_user_ids()
 
-            if uids is None:
-                break
+        #     if uids is None:
+        #         break
 
-            cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
-            truncate_start_pos = cached_start_pos + cached_len
-            batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
-            batch = batch.to(device=torch.cuda.current_device())
+        #     cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
+        #     truncate_start_pos = cached_start_pos + cached_len
+        #     batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+        #     batch = batch.to(device=torch.cuda.current_device())
 
-            model_predict.forward(batch, uids, truncate_start_pos)
+        #     model_predict.forward(batch, uids, truncate_start_pos)
 
-        num_test_batches = 16
+        num_test_batches = 60
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         predict_time = 0.0
         for idx in range(num_test_batches):
+            predict_time = 0.0
             uids = data_generator.get_inference_batch_user_ids()
 
             if uids is None:
                 break
 
             cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
+            # print(f"cached_start_pos: {cached_start_pos}, cached_len: {cached_len}")
             truncate_start_pos = cached_start_pos + cached_len
             batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
             batch = batch.to(device=torch.cuda.current_device())
+
+            # import pdb; pdb.set_trace()
 
             torch.cuda.synchronize()
             ts_start.record()
@@ -161,8 +174,28 @@ def run_ranking_gr_inference():
             ts_end.record()
             torch.cuda.synchronize()
             predict_time += ts_start.elapsed_time(ts_end)
-        print("Total time(ms):", predict_time)
+            # candidates = num_candidates + max_incremental_seqlen * 2, since max_incremental_seqlen brings both items and actions
+            print(f"Batch_size: {batch_size}, KV Caches: {truncate_start_pos[0]}, Candidate Embeddings: {num_candidates + max_incremental_seqlen * 2}, Total time(ms):", predict_time)
 
 
 if __name__ == "__main__":
-    run_ranking_gr_inference()
+    # for batch_size in [1, 8, 16]:
+    #     for seqlen in [512, 1024, 2048, 4096]:
+    #         run_ranking_gr_inference(batch_size=batch_size, seqlen=seqlen, num_candidates=256)
+    parser = argparse.ArgumentParser(description="HSTU Inference Script")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size for inference",
+    )
+    parser.add_argument(
+        "--num_candidates",
+        type=int,
+        default=256,
+        help="Number of candidate items for inference",
+    )
+
+    args = parser.parse_args()
+
+    run_ranking_gr_inference(batch_size=args.batch_size, num_candidates=args.num_candidates)

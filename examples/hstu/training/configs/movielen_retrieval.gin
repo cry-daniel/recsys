@@ -5,7 +5,7 @@ TrainerArgs.log_interval = 100
 TrainerArgs.ckpt_save_interval = -1
 TrainerArgs.seed = 1234
 
-DatasetArgs.dataset_name = 'ml-20m'
+DatasetArgs.dataset_name = 'ml-1m'
 DatasetArgs.max_sequence_length = 200
 DatasetArgs.shuffle = True
 
