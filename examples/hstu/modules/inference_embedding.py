@@ -366,6 +366,94 @@ class InferenceEmbedding(torch.nn.Module):
             embeddings = dynamic_embeddings
         return embeddings
 
+    # ==================== SSD Offload Methods ====================
+    
+    def init_ssd_storage(self, ssd_storage_path: str) -> None:
+        """
+        Initialize SSD storage for dynamic embedding tables.
+        
+        Args:
+            ssd_storage_path: Base directory path for SSD storage.
+        """
+        if hasattr(self._dynamic_embedding_collection, '_embedding_tables'):
+            self._dynamic_embedding_collection._embedding_tables.init_ssd_storage(ssd_storage_path)
+        else:
+            raise RuntimeError("Dynamic embedding collection does not support SSD storage.")
+
+    def offload_embeddings_to_ssd(
+        self,
+        table_name: str,
+        keys: torch.Tensor,
+    ) -> int:
+        """
+        Offload embeddings to SSD by keys.
+        
+        Args:
+            table_name: Name of the table.
+            keys: Tensor of keys to offload.
+            
+        Returns:
+            Number of embeddings offloaded.
+        """
+        if hasattr(self._dynamic_embedding_collection, '_embedding_tables'):
+            return self._dynamic_embedding_collection._embedding_tables.offload_to_ssd(table_name, keys)
+        else:
+            raise RuntimeError("Dynamic embedding collection does not support SSD offload.")
+
+    def load_embeddings_from_ssd(
+        self,
+        table_name: str,
+        keys: torch.Tensor,
+    ) -> int:
+        """
+        Load embeddings from SSD by keys.
+        
+        Args:
+            table_name: Name of the table.
+            keys: Tensor of keys to load.
+            
+        Returns:
+            Number of embeddings loaded.
+        """
+        if hasattr(self._dynamic_embedding_collection, '_embedding_tables'):
+            return self._dynamic_embedding_collection._embedding_tables.load_from_ssd(table_name, keys)
+        else:
+            raise RuntimeError("Dynamic embedding collection does not support SSD load.")
+
+    def get_ssd_storage_size(self, table_name: str) -> int:
+        """
+        Get the number of embeddings in SSD storage for a table.
+        
+        Args:
+            table_name: Name of the table.
+            
+        Returns:
+            Number of embeddings in SSD storage.
+        """
+        if hasattr(self._dynamic_embedding_collection, '_embedding_tables'):
+            return self._dynamic_embedding_collection._embedding_tables.ssd_storage_size(table_name)
+        else:
+            return 0
+
+    def close_ssd_storage(self) -> None:
+        """
+        Close all SSD storages and release resources.
+        """
+        if hasattr(self._dynamic_embedding_collection, '_embedding_tables'):
+            self._dynamic_embedding_collection._embedding_tables.close_ssd_storage()
+
+    def get_table_names(self) -> List[str]:
+        """
+        Get all dynamic embedding table names.
+        
+        Returns:
+            List of table names.
+        """
+        if hasattr(self._dynamic_embedding_collection, '_embedding_tables'):
+            return self._dynamic_embedding_collection._embedding_tables.table_names
+        else:
+            return []
+
 
 def get_inference_sparse_model(
     embedding_configs: List[InferenceEmbeddingConfig],

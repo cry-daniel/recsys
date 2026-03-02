@@ -40,6 +40,7 @@ from dynamicemb.key_value_table import (
 from dynamicemb.optimizer import *
 from dynamicemb.unique_op import UniqueOp
 from dynamicemb.utils import tabulate
+from dynamicemb.ssd_storage import SSDStorage
 from dynamicemb_extensions import DynamicEmbTable, OptimizerType, device_timestamp
 from torch import Tensor, nn  # usort:skip
 
@@ -1303,3 +1304,221 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             ret_scores[table_name] = self._scores[table_name]
 
         return ret_tensors, ret_scores
+
+    # ==================== SSD Offload Methods ====================
+    
+    def init_ssd_storage(self, ssd_storage_path: str) -> None:
+        """
+        Initialize SSD storage for all tables.
+        
+        Args:
+            ssd_storage_path: Base directory path for SSD storage.
+        """
+        if not hasattr(self, '_ssd_storages'):
+            self._ssd_storages: List[Optional[SSDStorage]] = []
+        
+        # Ensure we have the same number of SSD storages as tables
+        while len(self._ssd_storages) < len(self._table_names):
+            self._ssd_storages.append(None)
+        
+        for i, (table_name, option) in enumerate(zip(self._table_names, self._dynamicemb_options)):
+            if option.enable_ssd_offload:
+                table_ssd_path = os.path.join(ssd_storage_path, table_name)
+                self._ssd_storages[i] = SSDStorage(
+                    storage_path=table_ssd_path,
+                    dim=option.dim,
+                    dtype=option.embedding_dtype,
+                    key_dtype=option.index_type if option.index_type else torch.int64,
+                )
+                print(f"Initialized SSD storage for table '{table_name}' at {table_ssd_path}")
+
+    def offload_to_ssd(
+        self,
+        table_name: str,
+        keys: torch.Tensor,
+    ) -> int:
+        """
+        Offload embeddings to SSD by keys.
+        
+        Args:
+            table_name: Name of the table.
+            keys: Tensor of keys to offload.
+            
+        Returns:
+            Number of embeddings offloaded.
+        """
+        if not hasattr(self, '_ssd_storages') or self._ssd_storages is None:
+            raise RuntimeError("SSD storage not initialized. Call init_ssd_storage() first.")
+        
+        if table_name not in self._table_names:
+            raise ValueError(f"Table '{table_name}' not found.")
+        
+        idx = self._table_names.index(table_name)
+        ssd_storage = self._ssd_storages[idx]
+        
+        if ssd_storage is None:
+            raise RuntimeError(f"SSD storage not enabled for table '{table_name}'.")
+        
+        storage = self._storages[idx]
+        if not isinstance(storage, KeyValueTable):
+            raise RuntimeError("Only KeyValueTable supports SSD offload.")
+        
+        if keys.numel() == 0:
+            return 0
+        
+        device = torch.device(self.device_id)
+        emb_dim = storage.embedding_dim()
+        emb_dtype = storage.embedding_dtype()
+        
+        # Ensure keys are on the correct device
+        keys = keys.to(device)
+        
+        # Prepare tensor to hold embeddings
+        embeddings = torch.empty(
+            keys.numel(), emb_dim, dtype=emb_dtype, device=device
+        )
+        
+        # Find embeddings in storage
+        h_num_missing, missing_keys, missing_indices, _ = storage.find_embeddings(
+            keys, embeddings
+        )
+        
+        # Only offload keys that were found in storage
+        found_mask = torch.ones(keys.numel(), dtype=torch.bool, device=device)
+        if h_num_missing > 0:
+            found_mask[missing_indices[:h_num_missing]] = False
+        
+        found_keys = keys[found_mask]
+        found_embeddings = embeddings[found_mask]
+        
+        if found_keys.numel() == 0:
+            return 0
+        
+        # Insert into SSD storage
+        inserted = ssd_storage.insert(found_keys, found_embeddings)
+        
+        # Evict from DRAM storage
+        storage.evict(found_keys)
+        
+        return inserted
+
+    def load_from_ssd(
+        self,
+        table_name: str,
+        keys: torch.Tensor,
+    ) -> int:
+        """
+        Load embeddings from SSD by keys.
+        
+        Args:
+            table_name: Name of the table.
+            keys: Tensor of keys to load.
+            
+        Returns:
+            Number of embeddings loaded.
+        """
+        if not hasattr(self, '_ssd_storages') or self._ssd_storages is None:
+            raise RuntimeError("SSD storage not initialized. Call init_ssd_storage() first.")
+        
+        if table_name not in self._table_names:
+            raise ValueError(f"Table '{table_name}' not found.")
+        
+        idx = self._table_names.index(table_name)
+        ssd_storage = self._ssd_storages[idx]
+        
+        if ssd_storage is None:
+            raise RuntimeError(f"SSD storage not enabled for table '{table_name}'.")
+        
+        storage = self._storages[idx]
+        if not isinstance(storage, KeyValueTable):
+            raise RuntimeError("Only KeyValueTable supports SSD load.")
+        
+        if keys.numel() == 0:
+            return 0
+        
+        device = torch.device(self.device_id)
+        
+        # Ensure keys are on the correct device
+        keys = keys.to(device)
+        
+        # Lookup from SSD
+        embeddings, found_mask = ssd_storage.lookup(keys)
+        
+        if not found_mask.any():
+            return 0
+        
+        # Filter to found keys
+        found_keys = keys[found_mask]
+        found_embeddings = embeddings[found_mask]
+        
+        # Get the score for this table
+        score = self._scores.get(table_name, None)
+        
+        # Insert into DRAM storage using the insert method
+        # Note: We need to create a values tensor with the correct dimension
+        val_dim = storage.value_dim()
+        emb_dim = storage.embedding_dim()
+        
+        if val_dim == emb_dim:
+            # No optimizer state, just insert embeddings
+            storage.insert(found_keys, found_embeddings, score)
+        else:
+            # Need to add optimizer state
+            emb_dtype = storage.embedding_dtype()
+            values = torch.empty(
+                found_keys.numel(), val_dim, dtype=emb_dtype, device=device
+            )
+            values[:, :emb_dim] = found_embeddings
+            # Initialize optimizer state with default values
+            init_state = storage.init_optimizer_state()
+            values[:, emb_dim:].fill_(init_state)
+            storage.insert(found_keys, values, score)
+        
+        # Evict from SSD
+        ssd_storage.evict(found_keys)
+        
+        return found_keys.numel()
+
+    def get_ssd_storage(self, table_name: str) -> Optional[SSDStorage]:
+        """
+        Get SSD storage for a table.
+        
+        Args:
+            table_name: Name of the table.
+            
+        Returns:
+            SSDStorage instance or None if not enabled.
+        """
+        if not hasattr(self, '_ssd_storages'):
+            return None
+        
+        if table_name not in self._table_names:
+            raise ValueError(f"Table '{table_name}' not found.")
+        
+        idx = self._table_names.index(table_name)
+        return self._ssd_storages[idx] if idx < len(self._ssd_storages) else None
+
+    def ssd_storage_size(self, table_name: str) -> int:
+        """
+        Get the number of embeddings in SSD storage for a table.
+        
+        Args:
+            table_name: Name of the table.
+            
+        Returns:
+            Number of embeddings in SSD storage.
+        """
+        ssd_storage = self.get_ssd_storage(table_name)
+        if ssd_storage is None:
+            return 0
+        return len(ssd_storage)
+
+    def close_ssd_storage(self) -> None:
+        """
+        Close all SSD storages and release resources.
+        """
+        if hasattr(self, '_ssd_storages') and self._ssd_storages is not None:
+            for ssd_storage in self._ssd_storages:
+                if ssd_storage is not None:
+                    ssd_storage.close()
+            self._ssd_storages = None

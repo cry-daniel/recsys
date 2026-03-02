@@ -287,6 +287,14 @@ class DynamicEmbTableOptions(_ContextOptions):
         Counter for tracking the number of keys that have been admitted to the embedding table.
         If provided, the counter will be used to track the number of keys that have been admitted to the embedding table.
         Default is None (no counter is used).
+    enable_ssd_offload : bool
+        Flag to enable SSD offload for embeddings. Default is False.
+        When enabled, embeddings can be offloaded to SSD storage to free up DRAM.
+    ssd_storage_path : Optional[str], optional
+        Path to SSD storage directory for offloaded embeddings.
+        Required when enable_ssd_offload is True.
+    ssd_offload_batch_size : int
+        Batch size for SSD I/O operations. Default is 65536.
     Notes
     -----
     For detailed descriptions and additional context on each parameter, please refer to the documentation at
@@ -316,6 +324,11 @@ class DynamicEmbTableOptions(_ContextOptions):
     index_type: Optional[torch.dtype] = None
     admit_strategy: Optional[AdmissionStrategy] = None
     admission_counter: Optional[Counter] = None
+    
+    # SSD offload configuration
+    enable_ssd_offload: bool = False
+    ssd_storage_path: Optional[str] = None
+    ssd_offload_batch_size: int = 65536
 
     def __post_init__(self):
         assert (
