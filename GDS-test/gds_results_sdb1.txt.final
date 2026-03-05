@@ -1,0 +1,229 @@
+GDS Benchmark Results on sdb1 (/docker)
+Run: Wed Mar  4 11:40:37 AM UTC 2026
+
+==============================
+TEST: Non-GDS Write | 256K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 256K -x 1 -I 1 -T 120
+Wed Mar  4 11:40:37 AM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1274953728/4096000(KiB) IOSize: 256(KiB) Throughput: 10.188280 GiB/sec, Avg_Latency: 191.702182 usecs ops: 4980288 total_time 119.342086 secs
+Wed Mar  4 11:42:37 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 256K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 256K -x 1 -I 0 -T 120
+Wed Mar  4 11:43:07 AM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1241026560/4096000(KiB) IOSize: 256(KiB) Throughput: 9.884714 GiB/sec, Avg_Latency: 197.592816 usecs ops: 4847760 total_time 119.733885 secs
+Wed Mar  4 11:45:07 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 256K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 256K -x 0 -I 1 -T 120
+Wed Mar  4 11:45:37 AM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1290358016/4096000(KiB) IOSize: 256(KiB) Throughput: 10.327866 GiB/sec, Avg_Latency: 189.106959 usecs ops: 5040461 total_time 119.151561 secs
+Wed Mar  4 11:47:37 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 256K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 256K -x 0 -I 0 -T 120
+Wed Mar  4 11:48:07 AM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 972870144/4096000(KiB) IOSize: 256(KiB) Throughput: 7.732214 GiB/sec, Avg_Latency: 252.589326 usecs ops: 3800274 total_time 119.991669 secs
+Wed Mar  4 11:50:08 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Write | 512K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 512K -x 1 -I 1 -T 120
+Wed Mar  4 11:50:38 AM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1279814656/4096000(KiB) IOSize: 512(KiB) Throughput: 10.206944 GiB/sec, Avg_Latency: 382.702208 usecs ops: 2499638 total_time 119.578039 secs
+Wed Mar  4 11:52:38 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 512K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 512K -x 1 -I 0 -T 120
+Wed Mar  4 11:53:08 AM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1006962176/4096000(KiB) IOSize: 512(KiB) Throughput: 8.021053 GiB/sec, Avg_Latency: 486.996152 usecs ops: 1966723 total_time 119.724172 secs
+Wed Mar  4 11:55:08 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 512K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 512K -x 0 -I 1 -T 120
+Wed Mar  4 11:55:38 AM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1367356416/4096000(KiB) IOSize: 512(KiB) Throughput: 10.946558 GiB/sec, Avg_Latency: 356.840540 usecs ops: 2670618 total_time 119.125364 secs
+Wed Mar  4 11:57:38 AM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 512K
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 512K -x 0 -I 0 -T 120
+Wed Mar  4 11:58:08 AM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 996661248/4096000(KiB) IOSize: 512(KiB) Throughput: 7.920860 GiB/sec, Avg_Latency: 493.145908 usecs ops: 1946604 total_time 119.998362 secs
+Wed Mar  4 12:00:09 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Write | 1M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 1M -x 1 -I 1 -T 120
+Wed Mar  4 12:00:39 PM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1293220864/4096000(KiB) IOSize: 1024(KiB) Throughput: 10.312987 GiB/sec, Avg_Latency: 757.522775 usecs ops: 1262911 total_time 119.588200 secs
+Wed Mar  4 12:02:39 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 1M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 1M -x 1 -I 0 -T 120
+Wed Mar  4 12:03:09 PM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1012974592/4096000(KiB) IOSize: 1024(KiB) Throughput: 8.069109 GiB/sec, Avg_Latency: 968.178591 usecs ops: 989233 total_time 119.721753 secs
+Wed Mar  4 12:05:09 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 1M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 1M -x 0 -I 1 -T 120
+Wed Mar  4 12:05:39 PM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1366791168/4096000(KiB) IOSize: 1024(KiB) Throughput: 10.941425 GiB/sec, Avg_Latency: 713.997778 usecs ops: 1334757 total_time 119.131980 secs
+Wed Mar  4 12:07:39 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 1M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 1M -x 0 -I 0 -T 120
+Wed Mar  4 12:08:09 PM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 1020253184/4096000(KiB) IOSize: 1024(KiB) Throughput: 8.109407 GiB/sec, Avg_Latency: 963.353811 usecs ops: 996341 total_time 119.982794 secs
+Wed Mar  4 12:10:10 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Write | 2M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 2M -x 1 -I 1 -T 120
+Wed Mar  4 12:10:40 PM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1280008192/4096000(KiB) IOSize: 2048(KiB) Throughput: 10.209133 GiB/sec, Avg_Latency: 1530.429245 usecs ops: 625004 total_time 119.570480 secs
+Wed Mar  4 12:12:40 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 2M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 2M -x 1 -I 0 -T 120
+Wed Mar  4 12:13:10 PM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1037672448/4096000(KiB) IOSize: 2048(KiB) Throughput: 8.265194 GiB/sec, Avg_Latency: 1890.379913 usecs ops: 506676 total_time 119.731190 secs
+Wed Mar  4 12:15:10 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 2M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 2M -x 0 -I 1 -T 120
+Wed Mar  4 12:15:40 PM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1358194688/4096000(KiB) IOSize: 2048(KiB) Throughput: 10.872554 GiB/sec, Avg_Latency: 1437.000218 usecs ops: 663181 total_time 119.132582 secs
+Wed Mar  4 12:17:40 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 2M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 2M -x 0 -I 0 -T 120
+Wed Mar  4 12:18:10 PM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 960647168/4096000(KiB) IOSize: 2048(KiB) Throughput: 7.635216 GiB/sec, Avg_Latency: 2046.285415 usecs ops: 469066 total_time 119.989342 secs
+Wed Mar  4 12:20:11 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Write | 4M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 4M -x 1 -I 1 -T 120
+Wed Mar  4 12:20:41 PM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1289728000/4096000(KiB) IOSize: 4096(KiB) Throughput: 10.287343 GiB/sec, Avg_Latency: 3037.588995 usecs ops: 314875 total_time 119.562506 secs
+Wed Mar  4 12:22:41 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 4M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 4M -x 1 -I 0 -T 120
+Wed Mar  4 12:23:11 PM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1327198208/4096000(KiB) IOSize: 4096(KiB) Throughput: 10.573193 GiB/sec, Avg_Latency: 2955.461468 usecs ops: 324023 total_time 119.709807 secs
+Wed Mar  4 12:25:11 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 4M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 4M -x 0 -I 1 -T 120
+Wed Mar  4 12:25:41 PM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1388609536/4096000(KiB) IOSize: 4096(KiB) Throughput: 11.116902 GiB/sec, Avg_Latency: 2810.749472 usecs ops: 339016 total_time 119.123230 secs
+Wed Mar  4 12:27:41 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 4M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 4M -x 0 -I 0 -T 120
+Wed Mar  4 12:28:11 PM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 965832704/4096000(KiB) IOSize: 4096(KiB) Throughput: 7.677137 GiB/sec, Avg_Latency: 4070.100198 usecs ops: 235799 total_time 119.978299 secs
+Wed Mar  4 12:30:12 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Write | 8M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 8M -x 1 -I 1 -T 120
+Wed Mar  4 12:30:42 PM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1262256128/4096000(KiB) IOSize: 8192(KiB) Throughput: 10.069568 GiB/sec, Avg_Latency: 6206.536167 usecs ops: 154084 total_time 119.546467 secs
+Wed Mar  4 12:32:42 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 8M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 8M -x 1 -I 0 -T 120
+Wed Mar  4 12:33:12 PM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1323220992/4096000(KiB) IOSize: 8192(KiB) Throughput: 10.541696 GiB/sec, Avg_Latency: 5928.584695 usecs ops: 161526 total_time 119.707666 secs
+Wed Mar  4 12:35:12 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 8M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 8M -x 0 -I 1 -T 120
+Wed Mar  4 12:35:42 PM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1371398144/4096000(KiB) IOSize: 8192(KiB) Throughput: 10.979803 GiB/sec, Avg_Latency: 5691.391903 usecs ops: 167407 total_time 119.115725 secs
+Wed Mar  4 12:37:42 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 8M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 8M -x 0 -I 0 -T 120
+Wed Mar  4 12:38:12 PM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 1153597440/4096000(KiB) IOSize: 8192(KiB) Throughput: 9.170719 GiB/sec, Avg_Latency: 6814.293819 usecs ops: 140820 total_time 119.964018 secs
+Wed Mar  4 12:40:13 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Write | 16M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 16M -x 1 -I 1 -T 120
+Wed Mar  4 12:40:43 PM UTC 2026
+IoType: WRITE XferType: CPUONLY Threads: 8 DataSetSize: 1248100352/4096000(KiB) IOSize: 16384(KiB) Throughput: 9.955152 GiB/sec, Avg_Latency: 12564.011172 usecs ops: 76178 total_time 119.564349 secs
+Wed Mar  4 12:42:43 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: Non-GDS Read  | 16M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 16M -x 1 -I 0 -T 120
+Wed Mar  4 12:43:13 PM UTC 2026
+IoType: READ XferType: CPUONLY Threads: 8 DataSetSize: 1330462720/4096000(KiB) IOSize: 16384(KiB) Throughput: 10.600724 GiB/sec, Avg_Latency: 11799.376076 usecs ops: 81205 total_time 119.692586 secs
+Wed Mar  4 12:45:13 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Write     | 16M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 16M -x 0 -I 1 -T 120
+Wed Mar  4 12:45:43 PM UTC 2026
+IoType: WRITE XferType: GPUD Threads: 8 DataSetSize: 1402126336/4096000(KiB) IOSize: 16384(KiB) Throughput: 11.228675 GiB/sec, Avg_Latency: 11129.042749 usecs ops: 85579 total_time 119.085458 secs
+Wed Mar  4 12:47:43 PM UTC 2026
+
+Cooling down 30s...
+==============================
+TEST: GDS Read      | 16M
+CMD: /usr/local/cuda-13/gds/tools/gdsio -D /docker/gds_tmp -d 0 -w 8 -s 500M -i 16M -x 0 -I 0 -T 120
+Wed Mar  4 12:48:13 PM UTC 2026
+IoType: READ XferType: GPUD Threads: 8 DataSetSize: 959201280/4096000(KiB) IOSize: 16384(KiB) Throughput: 7.628229 GiB/sec, Avg_Latency: 16383.197557 usecs ops: 58545 total_time 119.918482 secs
+Wed Mar  4 12:50:14 PM UTC 2026
+
+Cooling down 30s...
+==============================
+All done: Wed Mar  4 12:50:44 PM UTC 2026
