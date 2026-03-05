@@ -11,3 +11,6 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node=1 ./inference/inference_gr_ranking.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ckpts/iter550/ --mode simulate
 
 CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) python3 ./inference/benchmark/inference_benchmark.py
+
+# for SSD
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node=1 embedding_storage_benchmark.py --scaling_test

@@ -928,26 +928,6 @@ class KeyValueTable(
     def optim_state_dim(self) -> int:
         return self.value_dim() - self.embedding_dim()
 
-    def evict(
-        self,
-        keys: torch.Tensor,
-    ) -> int:
-        """
-        Evict embeddings by keys from the table.
-        
-        Args:
-            keys: Tensor of keys to evict (shape: [N]).
-            
-        Returns:
-            Number of embeddings evicted.
-        """
-        if keys.numel() == 0:
-            return 0
-        
-        h_num_keys = keys.numel()
-        erase(self.table, h_num_keys, keys)
-        return h_num_keys
-
     def size(self) -> int:
         return dyn_emb_rows(self.table)
 
