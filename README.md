@@ -1,6 +1,6 @@
-# HSTU Inference Benchmark SOW
+# HSTU Inference Benchmark
 
-本文档描述了HSTU推理性能测试的标准操作流程(SOW)，包括环境配置、脚本运行和结果整理三个部分。
+本文档描述了HSTU推理性能测试的标准操作流程，包括环境配置、脚本运行和结果整理三个部分。
 
 ---
 
