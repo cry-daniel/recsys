@@ -77,6 +77,8 @@ def main():
         description="Distributed GR Arguments", allow_abbrev=False
     )
     parser.add_argument("--gin-config-file", type=str)
+    parser.add_argument("--max-retrieval-items", type=int, default=500,
+                        help="Maximum number of items to use for retrieval evaluation. Default: 500")
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
     trainer_args = TrainerArgs()
@@ -113,8 +115,9 @@ def main():
         pipeline_type=trainer_args.pipeline_type,
     )
     stateful_metric_module = RetrievalTaskMetricWithSampling(
-        metric_types=task_config.eval_metrics, MAX_K=500
+        metric_types=task_config.eval_metrics, MAX_K=args.max_retrieval_items
     )
+    print(f"Max retrieval items (MAX_K): {args.max_retrieval_items}")
     train_dataloader, test_dataloader = get_data_loader(
         "retrieval", dataset_args, trainer_args, 0
     )

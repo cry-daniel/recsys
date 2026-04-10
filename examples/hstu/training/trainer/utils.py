@@ -448,13 +448,13 @@ def get_dataset_and_embedding_args() -> (
             DynamicEmbeddingArgs(
                 feature_names=["video_id"],
                 table_name="video_id",
-                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_size_or_capacity=7551,
                 item_vocab_gpu_capacity_ratio=0.5,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
-                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_size_or_capacity=27285,
                 item_vocab_gpu_capacity_ratio=0.5,
             ),
         ]
@@ -499,13 +499,13 @@ def get_dataset_and_embedding_args() -> (
             DynamicEmbeddingArgs(
                 feature_names=["video_id"],
                 table_name="video_id",
-                item_vocab_size_or_capacity=HASH_SIZE,
-                item_vocab_gpu_capacity_ratio=0.5,
+                item_vocab_size_or_capacity=4369953,
+                item_vocab_gpu_capacity_ratio=0.2,
             ),
             DynamicEmbeddingArgs(
                 feature_names=["user_id"],
                 table_name="user_id",
-                item_vocab_size_or_capacity=HASH_SIZE,
+                item_vocab_size_or_capacity=1000,
                 item_vocab_gpu_capacity_ratio=0.5,
             ),
         ]

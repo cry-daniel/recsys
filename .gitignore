@@ -31,3 +31,6 @@ embedding_checkpoint/
 *.pickle
 *.xlsx
 pcie_lookup_poc/*
+ckpt*
+analysis_output
+*.out

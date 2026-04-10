@@ -79,6 +79,9 @@ class SequenceDataset(IterableDataset[Batch]):
         random_seed (int): The random seed for shuffling.
         is_train_dataset (bool): Whether this dataset is for training.
         nrows (int, optional): The number of rows to read from the file. Defaults to None, meaning all rows are read.
+        user_sequence_orders (dict, optional): Dictionary mapping user_id to a list of indices for reordering sequences.
+        userid_name (str, optional): The name of the user ID feature. Defaults to "user_id".
+        item_action_normalization (dict, optional): Dictionary mapping item_id to action value for normalizing actions.
     """
 
     def __init__(
@@ -98,6 +101,9 @@ class SequenceDataset(IterableDataset[Batch]):
         random_seed: int,
         is_train_dataset: bool,
         nrows: Optional[int] = None,
+        user_sequence_orders: Optional[Dict[int, List[int]]] = None,
+        userid_name: str = "user_id",
+        item_action_normalization: Optional[Dict[int, int]] = None,
     ) -> None:
         super().__init__()
         self._device = torch.cpu.current_device()
@@ -141,6 +147,11 @@ class SequenceDataset(IterableDataset[Batch]):
 
         self._sample_ids = np.arange(self._num_samples)
         self._shuffle_batch()
+        
+        # Store user sequence orders for reordering
+        self._user_sequence_orders = user_sequence_orders or {}
+        self._userid_name = userid_name
+        self._item_action_normalization = item_action_normalization or {}
 
     def _filter_short_sequences(
         self, item_feature_name: str, max_num_candidates: int
@@ -212,6 +223,23 @@ class SequenceDataset(IterableDataset[Batch]):
                     contextual_features_seqlen[contextual_feature_name].append(1)
 
                 item_seq = load_seq(data[self._item_feature_name])
+                action_seq = load_seq(data[self._action_feature_name])
+                
+                # Apply user sequence reordering if provided
+                uid = data[self._userid_name]
+                if uid in self._user_sequence_orders:
+                    order = self._user_sequence_orders[uid]
+                    # Apply order to both item and action sequences
+                    item_seq = [item_seq[i] for i in order if i < len(item_seq)]
+                    action_seq = [action_seq[i] for i in order if i < len(action_seq)]
+                
+                # Apply item-action normalization if provided
+                if self._item_action_normalization:
+                    action_seq = [
+                        self._item_action_normalization.get(item, action)
+                        for item, action in zip(item_seq, action_seq)
+                    ]
+                
                 if self._max_num_candidates > len(item_seq):
                     raise ValueError(
                         f"max_num_candidates: {self._max_num_candidates} > len(item_seq): {len(item_seq)}, please check data or decrease max_num_candidates"
@@ -229,7 +257,6 @@ class SequenceDataset(IterableDataset[Batch]):
                 item_features.extend(item_seq)
                 item_features_seqlen.append(len(item_seq))
 
-                action_seq = load_seq(data[self._action_feature_name])
                 candidate_action_seq = action_seq[-self._max_num_candidates :]
                 action_seq = action_seq[: -self._max_num_candidates]
                 action_seq = maybe_truncate_seq(

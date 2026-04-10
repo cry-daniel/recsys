@@ -1,9 +1,17 @@
+# ------------ Training Command ------------
+# CUDA_VISIBLE_DEVICES=0 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000  ./training/pretrain_gr_retrieval.py --gin-config-file ./training/configs/movielen_retrieval.gin
+# ------------ Evaluation Command ------------
+# CUDA_VISIBLE_DEVICES=0 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000  ./training/eval_checkpoint.py --gin-config-file ./training/configs/movielen_retrieval.gin --ckpt-load-dir ckpt_ml_20m_retrieval/iter1000/
 TrainerArgs.train_batch_size = 128
 TrainerArgs.eval_batch_size = 128
 TrainerArgs.eval_interval = 100
 TrainerArgs.log_interval = 100
 TrainerArgs.ckpt_save_interval = -1
 TrainerArgs.seed = 1234
+TrainerArgs.eval_interval = 50
+TrainerArgs.max_train_iters = 1000
+TrainerArgs.ckpt_save_interval = 1000
+TrainerArgs.ckpt_save_dir = "ckpt_ml_20m_retrieval"
 
 DatasetArgs.dataset_name = 'ml-20m'
 DatasetArgs.max_sequence_length = 200

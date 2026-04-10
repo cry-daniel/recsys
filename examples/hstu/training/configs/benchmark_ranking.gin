@@ -1,3 +1,8 @@
+# ------------ Training Command ------------
+# CUDA_VISIBLE_DEVICES=0 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 ./training/pretrain_gr_ranking.py --gin-config-file ./training/configs/benchmark_ranking.gin
+# ------------ Evaluation Command ------------
+# CUDA_VISIBLE_DEVICES=0 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6000 ./training/eval_checkpoint.py --gin-config-file ./training/configs/benchmark_ranking.gin --ckpt-load-dir ckpt_benchmark_ranking/iter512/
+# ------------ Training Config ------------
 TrainerArgs.train_batch_size = 32
 TrainerArgs.eval_batch_size = 32
 TrainerArgs.log_interval = 50
