@@ -254,24 +254,12 @@ def main():
     # Run evaluation
     print_rank_0("Starting evaluation...")
     pipeline._model.eval()
-    evaluate(
+    eval_metric_dict = evaluate(
         pipeline,
         stateful_metric_module,
         trainer_args=trainer_args,
         eval_loader=eval_dataloader,
     )
-
-    # Get metrics after evaluation
-    if is_retrieval:
-        retrieval_gr = get_unwrapped_module(pipeline._model)
-        export_table_name = retrieval_gr.get_item_feature_table_name()
-        eval_metric_dict, _, _ = stateful_metric_module.compute(
-            *retrieval_gr._embedding_collection.export_local_embedding(
-                export_table_name
-            ),
-        )
-    else:
-        eval_metric_dict = stateful_metric_module.compute()
 
     # Save results to CSV
     if args.output_file:
