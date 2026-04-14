@@ -1,5 +1,5 @@
 # ------------ Training Command ------------
-# CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6001  ./training/pretrain_gr_retrieval.py --gin-config-file ./training/configs/kuairand_1k_retrieval.gin --max-retrieval-items 10
+# CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6001  ./training/pretrain_gr_retrieval.py --gin-config-file ./training/configs/kuairand_1k_retrieval.gin
 # ------------ Evaluation Command ------------
 # CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6001  ./training/eval_checkpoint.py --gin-config-file ./training/configs/kuairand_1k_retrieval.gin --ckpt-load-dir ckpt_kr_1k_retrieval/iter1000/
 TrainerArgs.train_batch_size = 8
@@ -17,13 +17,15 @@ DatasetArgs.dataset_name = 'kuairand-1k'
 DatasetArgs.max_sequence_length = 4096
 DatasetArgs.shuffle = False
 
-NetworkArgs.num_layers = 8
+NetworkArgs.num_layers = 4
 NetworkArgs.num_attention_heads = 4
 NetworkArgs.hidden_size = 128
-NetworkArgs.kv_channels = 128
+NetworkArgs.kv_channels = 32
 
 RetrievalArgs.num_negatives = 128
 RetrievalArgs.eval_metrics = ("NDCG@10", "NDCG@20", "HR@10")
 
 OptimizerArgs.optimizer_str = 'adam'
 OptimizerArgs.learning_rate = 1e-3
+
+TensorModelParallelArgs.tensor_model_parallel_size = 1

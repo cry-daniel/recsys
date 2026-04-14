@@ -44,7 +44,7 @@ def evaluate(
     stateful_metric_module: torch.nn.Module,
     trainer_args: TrainerArgs,
     eval_loader: torch.utils.data.DataLoader,
-):
+) -> dict:
     eval_iter = 0
     torch.cuda.nvtx.range_push(f"#evaluate")
     max_eval_iters = trainer_args.max_eval_iters or len(eval_loader)
@@ -77,6 +77,7 @@ def evaluate(
         + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
     )
     torch.cuda.nvtx.range_pop()
+    return eval_metric_dict
 
 
 def maybe_load_ckpts(

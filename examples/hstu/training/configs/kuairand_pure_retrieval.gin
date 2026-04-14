@@ -16,11 +16,11 @@ DatasetArgs.dataset_name = 'kuairand-pure'
 DatasetArgs.max_sequence_length = 910
 DatasetArgs.shuffle = True
 
-NetworkArgs.num_layers = 8
+NetworkArgs.num_layers = 4
 NetworkArgs.num_attention_heads = 4
-NetworkArgs.hidden_size = 512
+NetworkArgs.hidden_size = 128
 # per head dim
-NetworkArgs.kv_channels = 128
+NetworkArgs.kv_channels = 32
 
 RetrievalArgs.num_negatives = 128
 RetrievalArgs.eval_metrics = ("NDCG@10", "NDCG@20", "HR@10")
