@@ -16,6 +16,7 @@ import os
 from itertools import chain, count, cycle, islice
 from typing import Iterator, Optional, Union
 
+import numpy as np
 import commons.checkpoint as checkpoint
 import torch  # pylint: disable-unused-import
 import torch.distributed as dist
@@ -32,7 +33,7 @@ from pipeline.train_pipeline import (
     JaggedMegatronTrainPipelineSparseDist,
 )
 from trainer.utils import cal_flops
-from utils import TrainerArgs
+from utils import RetrievalArgs, TrainerArgs
 
 
 def evaluate(
@@ -63,10 +64,69 @@ def evaluate(
         if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
             retrieval_gr = get_unwrapped_module(pipeline._model)
             export_table_name = retrieval_gr.get_item_feature_table_name()
-            eval_metric_dict, _, _ = stateful_metric_module.compute(
-                *retrieval_gr._embedding_collection.export_local_embedding(
+            
+            # Get eval_num_candidates from RetrievalArgs
+            retrieval_args = RetrievalArgs()
+            eval_num_candidates = retrieval_args.eval_num_candidates
+            
+            # Get target IDs from cached data (already collected during forward passes)
+            target_ids = torch.cat(stateful_metric_module._cache_target_ids).unique()
+            
+            # Get embedding collection and lookup only the target IDs
+            embedding_collection = retrieval_gr._embedding_collection
+            
+            # Try to get embeddings directly from the embedding weights (faster than exporting full table)
+            embedding_dim = retrieval_gr._embedding_dim
+            target_ids_np = target_ids.cpu().numpy()
+            
+            # Lookup embeddings from data_parallel embedding collection if available
+            if embedding_collection._data_parallel_embedding_collection is not None:
+                dp_emb = embedding_collection._data_parallel_embedding_collection
+                # Get the embedding weights directly
+                for name, param in dp_emb.named_parameters():
+                    if export_table_name in name:
+                        # Lookup specific IDs from the weight tensor
+                        all_embeddings = param.cpu().numpy()
+                        # Filter to only include valid IDs
+                        valid_mask = target_ids_np < all_embeddings.shape[0]
+                        valid_ids = target_ids_np[valid_mask]
+                        filtered_values = all_embeddings[valid_ids]
+                        filtered_keys = valid_ids
+                        break
+                else:
+                    # Fallback: export full table
+                    keys_array, values_array = embedding_collection.export_local_embedding(
+                        export_table_name
+                    )
+                    mask = np.isin(keys_array, target_ids_np)
+                    filtered_keys = keys_array[mask]
+                    filtered_values = values_array[mask]
+            else:
+                # Fallback: export full table
+                keys_array, values_array = embedding_collection.export_local_embedding(
                     export_table_name
-                ),
+                )
+                mask = np.isin(keys_array, target_ids_np)
+                filtered_keys = keys_array[mask]
+                filtered_values = values_array[mask]
+            
+            # Pad with random embeddings to eval_num_candidates
+            num_filtered = len(filtered_keys)
+            if num_filtered < eval_num_candidates:
+                num_to_pad = eval_num_candidates - num_filtered
+                max_key = int(filtered_keys.max()) + 1 if filtered_keys.size > 0 else 100000
+                random_keys = np.random.randint(0, max_key, size=num_to_pad)
+                random_values = np.random.randn(
+                    num_to_pad, embedding_dim
+                ).astype(filtered_values.dtype)
+                final_keys = np.concatenate([filtered_keys, random_keys])
+                final_values = np.concatenate([filtered_values, random_values])
+            else:
+                final_keys = filtered_keys
+                final_values = filtered_values
+            
+            eval_metric_dict, _, _ = stateful_metric_module.compute(
+                final_keys, final_values
             )
         else:
             eval_metric_dict = stateful_metric_module.compute()

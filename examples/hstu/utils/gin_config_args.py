@@ -403,6 +403,9 @@ class RetrievalArgs:
         l2_norm_eps (float): Epsilon value for L2 normalization. Default: 1e-6.
         eval_metrics (Tuple[str, ...]): Evaluation metrics tuple (Hit Rate, NDCG).
             Default: ("HR@10", "NDCG@10").
+        eval_num_candidates (int): Number of candidate items for evaluation. The eval
+            candidate pool consists of the last 100 items from user history sequences,
+            padded with random embeddings to this size. Default: 2000.
     """
 
     ### retrieval
@@ -410,3 +413,4 @@ class RetrievalArgs:
     temperature = 0.05
     l2_norm_eps = 1e-6
     eval_metrics: Tuple[str, ...] = ("HR@10", "NDCG@10")
+    eval_num_candidates: int = 2000

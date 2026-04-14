@@ -3,18 +3,19 @@
 # ------------ Evaluation Command ------------
 # CUDA_VISIBLE_DEVICES=1 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 1 --master_addr localhost --master_port 6001  ./training/eval_checkpoint.py --gin-config-file ./training/configs/kuairand_1k_retrieval.gin --ckpt-load-dir ckpt_kr_1k_retrieval/iter1000/
 TrainerArgs.train_batch_size = 8
-TrainerArgs.eval_batch_size = 8
+TrainerArgs.eval_batch_size = 1
 TrainerArgs.log_interval = 10
 TrainerArgs.eval_interval = 10
 TrainerArgs.log_interval = 10
 TrainerArgs.max_train_iters = 1000
-TrainerArgs.eval_interval = 50
+TrainerArgs.eval_interval = 1001
+RetrievalArgs.eval_num_candidates = 500
 TrainerArgs.max_train_iters = 1000
 TrainerArgs.ckpt_save_interval = 1000
 TrainerArgs.ckpt_save_dir = "ckpt_kr_1k_retrieval"
 
 DatasetArgs.dataset_name = 'kuairand-1k'
-DatasetArgs.max_sequence_length = 4096
+DatasetArgs.max_sequence_length = 1024
 DatasetArgs.shuffle = False
 
 NetworkArgs.num_layers = 4
