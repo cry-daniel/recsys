@@ -34,3 +34,8 @@ pcie_lookup_poc/*
 ckpt*
 analysis_output
 *.out
+.codex
+*.bak
+training_logs*
+eval_logs*
+*kv_replace_opt*
