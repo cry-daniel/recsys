@@ -32,10 +32,13 @@ embedding_checkpoint/
 *.xlsx
 pcie_lookup_poc/*
 ckpt*
-analysis_output
+analysis_output*
 *.out
 .codex
 *.bak
 training_logs*
 eval_logs*
 *kv_replace_opt*
+user_pattern_analysis*
+*rules.md
+temp_code
