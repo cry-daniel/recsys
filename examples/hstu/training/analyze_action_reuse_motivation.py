@@ -98,14 +98,14 @@ def parse_args() -> argparse.Namespace:
         "--window-sizes",
         type=int,
         nargs="+",
-        default=[128, 256, 512, 1024],
+        default=[64, 128, 256, 512, 1024],
         help="Interleaved token window sizes to sweep.",
     )
     parser.add_argument(
         "--top-ks",
         type=int,
         nargs="+",
-        default=[1, 2, 3, 5],
+        default=[1, 2, 3, 4, 5],
         help="Top-K action counts to sweep per user/window.",
     )
     parser.add_argument(
@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-window-rows",
         type=int,
-        default=200000,
+        default=5000,
         help=(
             "Maximum detailed rows written to window_action_concentration.csv. "
             "Use 0 to write all rows."
@@ -153,6 +153,49 @@ def parse_args() -> argparse.Namespace:
             "reuse_auc_impact_*.csv. Requires --gin-config-file and --ckpt-load-dir."
         ),
     )
+    parser.add_argument(
+        "--run-policy-grid-auc-analysis",
+        action="store_true",
+        help=(
+            "Run global window/top-K AUC grid for Q3. Uses --window-sizes and --top-ks."
+        ),
+    )
+    parser.add_argument(
+        "--run-layer-policy-auc-analysis",
+        action="store_true",
+        help=(
+            "Run per-layer AUC sensitivity for Q4. One layer is enabled per run."
+        ),
+    )
+    parser.add_argument(
+        "--layer-window-sizes",
+        type=int,
+        nargs="+",
+        default=[64],
+        help=(
+            "Interleaved token window sizes for --run-layer-policy-auc-analysis. "
+            "Kept separate from --window-sizes so global grid search can be broad "
+            "while layer sensitivity stays cheap."
+        ),
+    )
+    parser.add_argument(
+        "--layer-top-ks",
+        type=int,
+        nargs="+",
+        default=[1],
+        help=(
+            "Top-K values for --run-layer-policy-auc-analysis. "
+            "Default top1 isolates layer sensitivity without running a full grid per layer."
+        ),
+    )
+    parser.add_argument(
+        "--run-user-bucket-policy-auc-analysis",
+        action="store_true",
+        help=(
+            "Run user-length-bucket window/top-K AUC grid for Q5. "
+            "One length bucket is enabled per run."
+        ),
+    )
     parser.add_argument("--gin-config-file", type=str, default=None)
     parser.add_argument("--ckpt-load-dir", type=str, default=None)
     parser.add_argument("--kv-max-batches", type=int, default=3)
@@ -173,7 +216,43 @@ def parse_args() -> argparse.Namespace:
         default=2000,
         help="Maximum different-action KV pairs sampled per user/layer for same-vs-different action analysis.",
     )
+    parser.add_argument(
+        "--kv-distance-buckets",
+        type=int,
+        nargs="+",
+        default=[64, 128, 256, 512, 1024],
+        help=(
+            "Interleaved-token distance bucket upper bounds for real-KV similarity. "
+            "For example 64 128 256 creates <=64, 65-128, 129-256, and >256."
+        ),
+    )
+    parser.add_argument(
+        "--kv-max-pairs-per-distance-bucket",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, cap sampled real-KV pairs per distance bucket and pair type. "
+            "This prevents one very dense bucket from dominating distance-aware summaries."
+        ),
+    )
     parser.add_argument("--kv-window-size", type=int, default=512)
+    parser.add_argument(
+        "--write-raw-kv-pairs",
+        action="store_true",
+        help=(
+            "Write full real-KV pair-level CSVs. By default only compact summaries "
+            "and small sample CSVs are written to keep motivation outputs small."
+        ),
+    )
+    parser.add_argument(
+        "--max-raw-kv-pair-rows",
+        type=int,
+        default=10000,
+        help=(
+            "Maximum sampled pair rows to write when --write-raw-kv-pairs is not set. "
+            "Use 0 to skip sampled pair CSVs."
+        ),
+    )
     parser.add_argument(
         "--auc-reuse-token-types",
         type=str,
@@ -189,18 +268,22 @@ def parse_args() -> argparse.Namespace:
         default=[
             "global_first_any_action_legacy",
             "same_id_max_distance",
+            "same_id_max_distance_no_chain",
             "wrong_id_same_window",
             "global_same_id",
             "global_topk_same_id",
             "window_topk_same_id",
+            "window_topk_same_id_max_distance",
         ],
         choices=[
             "window_topk_same_id",
+            "window_topk_same_id_max_distance",
             "global_same_id",
             "global_topk_same_id",
             "wrong_id_same_window",
             "global_first_any_action_legacy",
             "same_id_max_distance",
+            "same_id_max_distance_no_chain",
         ],
         help="Reuse strategies evaluated by --run-auc-impact-analysis.",
     )
@@ -237,6 +320,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional inline JSON or JSON path for layer/user-wise AUC impact reuse policy.",
+    )
+    parser.add_argument(
+        "--auc-kv-replace-implementation",
+        type=str,
+        default="hidden_proxy",
+        choices=["hidden_proxy", "kv_only"],
+        help=(
+            "Implementation used by checkpoint AUC impact analysis. "
+            "hidden_proxy copies layer inputs before UVQK; kv_only copies projected K/V only."
+        ),
     )
     parser.add_argument(
         "--auc-max-eval-iters",
@@ -934,17 +1027,25 @@ def run_data_analysis(args: argparse.Namespace) -> Tuple[str, str, str, List[Use
 
 
 def run_optional_kv_analysis(args: argparse.Namespace) -> None:
-    if not args.run_kv_analysis and not args.run_auc_impact_analysis:
+    if not (
+        args.run_kv_analysis
+        or args.run_auc_impact_analysis
+        or args.run_policy_grid_auc_analysis
+        or args.run_layer_policy_auc_analysis
+        or args.run_user_bucket_policy_auc_analysis
+    ):
         return
     if args.gin_config_file is None or args.ckpt_load_dir is None:
         raise ValueError(
-            "--run-kv-analysis/--run-auc-impact-analysis requires "
-            "--gin-config-file and --ckpt-load-dir"
+            "--run-kv-analysis/--run-auc-impact-analysis/--run-*-policy-auc-analysis "
+            "requires --gin-config-file and --ckpt-load-dir"
         )
 
     # Keep the heavyweight HSTU/GPU path isolated so the default data-side
     # analysis remains usable in lightweight environments.
     from analyze_action_reuse_motivation_kv_impl import (
+        _write_motivation_insights_markdown,
+        run_policy_grid_auc_analysis,
         run_auc_impact_analysis,
         run_kv_motivation_analysis,
     )
@@ -955,12 +1056,52 @@ def run_optional_kv_analysis(args: argparse.Namespace) -> None:
     if args.run_auc_impact_analysis:
         record_report_command(args, "auc_impact_analysis")
         run_auc_impact_analysis(args)
+    if args.run_policy_grid_auc_analysis:
+        record_report_command(args, "policy_grid_auc_analysis")
+        run_policy_grid_auc_analysis(args, mode="global")
+    if args.run_layer_policy_auc_analysis:
+        record_report_command(args, "layer_policy_auc_analysis")
+        run_policy_grid_auc_analysis(args, mode="layer")
+    if args.run_user_bucket_policy_auc_analysis:
+        record_report_command(args, "user_bucket_policy_auc_analysis")
+        run_policy_grid_auc_analysis(args, mode="user_bucket")
+    if (
+        args.run_kv_analysis
+        and not args.run_auc_impact_analysis
+        and not args.run_policy_grid_auc_analysis
+        and not args.run_layer_policy_auc_analysis
+        and not args.run_user_bucket_policy_auc_analysis
+    ):
+        _write_motivation_insights_markdown(
+            args.output_dir,
+            auc_summary=pd.DataFrame(),
+            eligible_metrics=[],
+            threshold=args.auc_filter_baseline_threshold,
+        )
 
 
 def main() -> None:
     args = parse_args()
     seq_file, item_feature_name, action_feature_name, users = run_data_analysis(args)
     run_optional_kv_analysis(args)
+    if not (
+        args.run_kv_analysis
+        or args.run_auc_impact_analysis
+        or args.run_policy_grid_auc_analysis
+        or args.run_layer_policy_auc_analysis
+        or args.run_user_bucket_policy_auc_analysis
+    ):
+        try:
+            from analyze_action_reuse_motivation_kv_impl import _write_motivation_insights_markdown
+
+            _write_motivation_insights_markdown(
+                args.output_dir,
+                auc_summary=pd.DataFrame(),
+                eligible_metrics=[],
+                threshold=args.auc_filter_baseline_threshold,
+            )
+        except ModuleNotFoundError:
+            pass
     print(f"Loaded {len(users)} users from {seq_file}")
     print(f"Item feature: {item_feature_name}, action feature: {action_feature_name}")
     print(f"Saved action reuse motivation outputs to {os.path.abspath(args.output_dir)}")

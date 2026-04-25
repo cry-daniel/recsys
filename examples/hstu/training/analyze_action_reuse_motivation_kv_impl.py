@@ -9,7 +9,7 @@ with `--run-kv-analysis`, keeping the default data-side path lightweight.
 import json
 import os
 from itertools import combinations, islice
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -131,15 +131,15 @@ class KVMotivationCaptureHook:
     def _compute_fused_kv(module, normed_x: torch.Tensor):
         mixed_uvqk = F.linear(normed_x, module._linear_uvqk_weight.t(), module._linear_uvqk_bias)
         silu_uvqk = F.silu(mixed_uvqk)
-        total_dim_per_head = module._linear_dim_per_head * 2 + module._attention_dim_per_head * 2
-        silu_uvqk = silu_uvqk.view(-1, module._num_heads, total_dim_per_head)
         split_sizes = [
-            module._linear_dim_per_head,
-            module._linear_dim_per_head,
-            module._attention_dim_per_head,
-            module._attention_dim_per_head,
+            module._linear_dim_per_head * module._num_heads,
+            module._linear_dim_per_head * module._num_heads,
+            module._attention_dim_per_head * module._num_heads,
+            module._attention_dim_per_head * module._num_heads,
         ]
         _, value, _, key = torch.split(silu_uvqk, split_sizes, dim=-1)
+        value = value.view(-1, module._num_heads, module._linear_dim_per_head)
+        key = key.view(-1, module._num_heads, module._attention_dim_per_head)
         return key, value
 
 
@@ -159,17 +159,96 @@ def _extract_feature_ids(batch, feature_name: Optional[str], fallback_index: int
     return None
 
 
-DISTANCE_BUCKETS = (128, 256, 512, 1024)
+DEFAULT_DISTANCE_BUCKETS = (64, 128, 256, 512, 1024)
 
 
-def _distance_bucket(distance: int, window_size: int) -> str:
-    del window_size
+def _normalize_distance_buckets(raw_buckets) -> List[int]:
+    buckets = sorted({int(boundary) for boundary in raw_buckets if int(boundary) > 0})
+    return buckets or list(DEFAULT_DISTANCE_BUCKETS)
+
+
+def _distance_bucket(distance: int, distance_buckets) -> str:
+    buckets = _normalize_distance_buckets(distance_buckets)
     prev = 0
-    for boundary in DISTANCE_BUCKETS:
+    for boundary in buckets:
         if distance <= boundary:
             return f"{prev + 1}-{boundary}" if prev else f"<= {boundary}"
         prev = boundary
-    return f"> {DISTANCE_BUCKETS[-1]}"
+    return f"> {buckets[-1]}"
+
+
+def _distance_bucket_sort_key(bucket: str) -> int:
+    text = str(bucket).strip()
+    if text.startswith("<="):
+        return int(text.split("<=", 1)[1].strip())
+    if text.startswith(">"):
+        return int(text.split(">", 1)[1].strip()) + 1
+    if "-" in text:
+        return int(text.split("-", 1)[0].strip())
+    return 10**12
+
+
+def _cap_pairs_by_distance_bucket(
+    pairs: List[tuple],
+    *,
+    distance_buckets,
+    max_pairs_per_distance_bucket: int,
+    bucket_key_offset: int = 0,
+) -> List[tuple]:
+    if max_pairs_per_distance_bucket <= 0 or not pairs:
+        return pairs
+
+    grouped: Dict[str, List[tuple]] = {}
+    for pair in pairs:
+        left = pair[bucket_key_offset]
+        right = pair[bucket_key_offset + 1]
+        distance = right["local_pos"] - left["local_pos"]
+        grouped.setdefault(_distance_bucket(distance, distance_buckets), []).append(pair)
+
+    capped = []
+    for bucket_pairs in grouped.values():
+        if len(bucket_pairs) <= max_pairs_per_distance_bucket:
+            capped.extend(bucket_pairs)
+            continue
+        idx = np.linspace(
+            0,
+            len(bucket_pairs) - 1,
+            num=max_pairs_per_distance_bucket,
+            dtype=np.int64,
+        )
+        capped.extend(bucket_pairs[int(i)] for i in idx)
+    return capped
+
+
+def _cap_action_pair_specs_by_distance_bucket(
+    pair_specs: List[tuple],
+    *,
+    distance_buckets,
+    max_pairs_per_distance_bucket: int,
+) -> List[tuple]:
+    if max_pairs_per_distance_bucket <= 0 or not pair_specs:
+        return pair_specs
+
+    grouped: Dict[tuple, List[tuple]] = {}
+    for pair_spec in pair_specs:
+        same_action, left, right = pair_spec
+        distance = right["local_pos"] - left["local_pos"]
+        key = (same_action, _distance_bucket(distance, distance_buckets))
+        grouped.setdefault(key, []).append(pair_spec)
+
+    capped = []
+    for bucket_specs in grouped.values():
+        if len(bucket_specs) <= max_pairs_per_distance_bucket:
+            capped.extend(bucket_specs)
+            continue
+        idx = np.linspace(
+            0,
+            len(bucket_specs) - 1,
+            num=max_pairs_per_distance_bucket,
+            dtype=np.int64,
+        )
+        capped.extend(bucket_specs[int(i)] for i in idx)
+    return capped
 
 
 def _pair_metrics(left: torch.Tensor, right: torch.Tensor) -> Dict[str, float]:
@@ -246,8 +325,10 @@ def _iter_capped_pairs(refs: List[Dict], max_pairs_per_token_id: int):
 def _records_to_pair_frame(
     records: List[Dict],
     window_size: int,
+    distance_buckets,
     max_tokens_per_user: int,
     max_pairs_per_token_id: int = 0,
+    max_pairs_per_distance_bucket: int = 0,
 ) -> pd.DataFrame:
     rows = []
     for record in records:
@@ -295,7 +376,13 @@ def _records_to_pair_frame(
             for ref in token_refs:
                 by_token.setdefault((ref["token_type"], ref["token_id"]), []).append(ref)
             for (token_type, token_id), refs in by_token.items():
-                for left, right in _iter_capped_pairs(refs, max_pairs_per_token_id):
+                pairs = _iter_capped_pairs(refs, max_pairs_per_token_id)
+                pairs = _cap_pairs_by_distance_bucket(
+                    pairs,
+                    distance_buckets=distance_buckets,
+                    max_pairs_per_distance_bucket=max_pairs_per_distance_bucket,
+                )
+                for left, right in pairs:
                     same_window = (left["local_pos"] // window_size) == (
                         right["local_pos"] // window_size
                     )
@@ -312,7 +399,7 @@ def _records_to_pair_frame(
                             "pos_i": left["local_pos"],
                             "pos_j": right["local_pos"],
                             "pos_distance": pos_distance,
-                            "distance_bucket": _distance_bucket(pos_distance, window_size),
+                            "distance_bucket": _distance_bucket(pos_distance, distance_buckets),
                             "same_window": same_window,
                             "k_cosine": k_metrics["cosine"],
                             "k_centered_cosine": k_metrics["centered_cosine"],
@@ -353,9 +440,11 @@ def _sample_different_action_pairs(
 def _records_to_action_same_diff_pair_frame(
     records: List[Dict],
     window_size: int,
+    distance_buckets,
     max_actions_per_user: int,
     max_same_pairs_per_action_id: int,
     max_different_pairs_per_user: int,
+    max_pairs_per_distance_bucket: int,
     random_seed: int = 2025,
 ) -> pd.DataFrame:
     rows = []
@@ -396,6 +485,11 @@ def _records_to_action_same_diff_pair_frame(
                 rng,
             ):
                 pair_specs.append((False, left, right))
+            pair_specs = _cap_action_pair_specs_by_distance_bucket(
+                pair_specs,
+                distance_buckets=distance_buckets,
+                max_pairs_per_distance_bucket=max_pairs_per_distance_bucket,
+            )
 
             for same_action, left, right in pair_specs:
                 same_window = (left["local_pos"] // window_size) == (
@@ -415,7 +509,7 @@ def _records_to_action_same_diff_pair_frame(
                         "pos_i": left["local_pos"],
                         "pos_j": right["local_pos"],
                         "pos_distance": pos_distance,
-                        "distance_bucket": _distance_bucket(pos_distance, window_size),
+                        "distance_bucket": _distance_bucket(pos_distance, distance_buckets),
                         "same_window": same_window,
                         "k_cosine": k_metrics["cosine"],
                         "k_centered_cosine": k_metrics["centered_cosine"],
@@ -452,6 +546,52 @@ def _build_action_same_diff_summary(pair_df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
+
+
+def _build_action_same_diff_distance_summary(pair_df: pd.DataFrame) -> pd.DataFrame:
+    if pair_df.empty:
+        return pd.DataFrame()
+
+    parts = []
+    for layer_group, group in (
+        ("all_layers", pair_df),
+        ("contextual_layers", pair_df[pair_df["layer_idx"] > 0]),
+    ):
+        if group.empty:
+            continue
+        summary = (
+            group.groupby(["same_action", "distance_bucket"], sort=False)
+            .agg(
+                k_cosine_mean=("k_cosine", "mean"),
+                k_cosine_median=("k_cosine", "median"),
+                k_cosine_p10=("k_cosine", lambda x: x.quantile(0.10)),
+                k_cosine_p90=("k_cosine", lambda x: x.quantile(0.90)),
+                k_centered_cosine_mean=("k_centered_cosine", "mean"),
+                k_relative_l2_mean=("k_relative_l2", "mean"),
+                v_cosine_mean=("v_cosine", "mean"),
+                v_cosine_median=("v_cosine", "median"),
+                v_cosine_p10=("v_cosine", lambda x: x.quantile(0.10)),
+                v_cosine_p90=("v_cosine", lambda x: x.quantile(0.90)),
+                v_centered_cosine_mean=("v_centered_cosine", "mean"),
+                v_relative_l2_mean=("v_relative_l2", "mean"),
+                pos_distance_mean=("pos_distance", "mean"),
+                pair_count=("k_cosine", "count"),
+            )
+            .reset_index()
+        )
+        summary.insert(0, "layer_group", layer_group)
+        parts.append(summary)
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    out["_distance_sort"] = out["distance_bucket"].map(_distance_bucket_sort_key)
+    out = out.sort_values(
+        ["layer_group", "same_action", "_distance_sort"],
+        ascending=[True, False, True],
+    ).drop(
+        columns=["_distance_sort"]
+    )
+    return out
 
 
 def _plot_action_same_diff_outputs(pair_df: pd.DataFrame, output_dir: str) -> None:
@@ -631,7 +771,24 @@ def _plot_kv_outputs(pair_df: pd.DataFrame, summary_df: pd.DataFrame, output_dir
         ax.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "item_vs_action_kv_similarity_by_distance.png"), dpi=160)
-        plt.close(fig)
+    plt.close(fig)
+
+
+def _write_pair_frame_for_debug(
+    df: pd.DataFrame,
+    *,
+    output_dir: str,
+    raw_name: str,
+    sample_name: str,
+    write_raw: bool,
+    max_sample_rows: int,
+) -> None:
+    if write_raw:
+        df.to_csv(os.path.join(output_dir, raw_name), index=False)
+        return
+    if max_sample_rows <= 0 or df.empty:
+        return
+    df.head(max_sample_rows).to_csv(os.path.join(output_dir, sample_name), index=False)
 
 
 def run_kv_motivation_analysis(args) -> None:
@@ -720,28 +877,52 @@ def run_kv_motivation_analysis(args) -> None:
     pair_df = _records_to_pair_frame(
         capture.records,
         window_size=args.kv_window_size,
+        distance_buckets=args.kv_distance_buckets,
         max_tokens_per_user=args.kv_max_actions_per_user,
         max_pairs_per_token_id=args.kv_max_pairs_per_token_id,
+        max_pairs_per_distance_bucket=args.kv_max_pairs_per_distance_bucket,
     )
     action_same_diff_df = _records_to_action_same_diff_pair_frame(
         capture.records,
         window_size=args.kv_window_size,
+        distance_buckets=args.kv_distance_buckets,
         max_actions_per_user=args.kv_max_actions_per_user,
         max_same_pairs_per_action_id=args.kv_max_pairs_per_token_id,
         max_different_pairs_per_user=args.kv_max_different_action_pairs_per_user,
+        max_pairs_per_distance_bucket=args.kv_max_pairs_per_distance_bucket,
     )
-    action_same_diff_path = os.path.join(args.output_dir, "action_kv_same_vs_diff_pairs.csv")
-    action_same_diff_df.to_csv(action_same_diff_path, index=False)
+    _write_pair_frame_for_debug(
+        action_same_diff_df,
+        output_dir=args.output_dir,
+        raw_name="action_kv_same_vs_diff_pairs.csv",
+        sample_name="action_kv_same_vs_diff_pairs_sample.csv",
+        write_raw=args.write_raw_kv_pairs,
+        max_sample_rows=args.max_raw_kv_pair_rows,
+    )
     action_same_diff_summary_df = _build_action_same_diff_summary(action_same_diff_df)
     action_same_diff_summary_df.to_csv(
         os.path.join(args.output_dir, "action_kv_same_vs_diff_summary.csv"),
         index=False,
     )
+    action_same_diff_distance_summary_df = _build_action_same_diff_distance_summary(
+        action_same_diff_df
+    )
+    action_same_diff_distance_summary_df.to_csv(
+        os.path.join(args.output_dir, "action_kv_same_vs_diff_distance_summary.csv"),
+        index=False,
+    )
     _plot_action_same_diff_outputs(action_same_diff_df, args.output_dir)
 
-    pair_path = os.path.join(args.output_dir, "item_action_kv_similarity_pairs.csv")
-    pair_df.to_csv(pair_path, index=False)
-    pair_df.to_csv(os.path.join(args.output_dir, "kv_pair_similarity.csv"), index=False)
+    _write_pair_frame_for_debug(
+        pair_df,
+        output_dir=args.output_dir,
+        raw_name="item_action_kv_similarity_pairs.csv",
+        sample_name="item_action_kv_similarity_pairs_sample.csv",
+        write_raw=args.write_raw_kv_pairs,
+        max_sample_rows=args.max_raw_kv_pair_rows,
+    )
+    if args.write_raw_kv_pairs:
+        pair_df.to_csv(os.path.join(args.output_dir, "kv_pair_similarity.csv"), index=False)
     if pair_df.empty:
         pd.DataFrame().to_csv(os.path.join(args.output_dir, "kv_similarity_summary.csv"), index=False)
         pd.DataFrame().to_csv(
@@ -850,13 +1031,482 @@ def run_auc_impact_analysis(args) -> None:
             reuse_token_types=args.auc_reuse_token_types,
             reuse_strategies=args.auc_reuse_strategies,
             reuse_max_distances=args.auc_reuse_max_distances,
+            replacement_impl=args.auc_kv_replace_implementation,
+            report_command=args.report_command,
         )
         _write_filtered_auc_summary_and_markdown(args.output_dir, args.auc_filter_baseline_threshold)
     finally:
         base.init.destroy_global_state()
 
 
+def _policy_json_for_grid(
+    *,
+    mode: str,
+    window_size: int,
+    top_k: int,
+    layer_idx: Optional[int] = None,
+    bucket: Optional[Dict] = None,
+) -> str:
+    if mode == "global":
+        policy = {"default": {"window_size": window_size, "top_k": top_k}}
+    elif mode == "layer":
+        if layer_idx is None:
+            raise ValueError("layer policy grid requires layer_idx")
+        policy = {
+            "default": {"window_size": window_size, "top_k": 0},
+            "layers": {str(layer_idx): {"window_size": window_size, "top_k": top_k}},
+        }
+    elif mode == "user_bucket":
+        if bucket is None:
+            raise ValueError("user bucket policy grid requires bucket")
+        policy = {
+            "default": {"window_size": window_size, "top_k": 0},
+            "user_length_buckets": [
+                {
+                    "min_seq_len": bucket["min_seq_len"],
+                    **(
+                        {}
+                        if bucket["max_seq_len"] is None
+                        else {"max_seq_len": bucket["max_seq_len"]}
+                    ),
+                    "window_size": window_size,
+                    "top_k": top_k,
+                }
+            ],
+        }
+    else:
+        raise ValueError(f"unknown policy grid mode: {mode}")
+    return json.dumps(policy, sort_keys=True)
+
+
+def _user_length_buckets_from_args(args) -> List[Dict]:
+    starts = sorted({int(x) for x in args.long_user_buckets if int(x) >= 0})
+    if not starts or starts[0] != 0:
+        starts = [0, *starts]
+    buckets = []
+    for idx, start in enumerate(starts):
+        next_start = starts[idx + 1] if idx + 1 < len(starts) else None
+        buckets.append(
+            {
+                "bucket": f"{start}+" if next_start is None else f"{start}-{next_start - 1}",
+                "min_seq_len": start,
+                "max_seq_len": None if next_start is None else next_start - 1,
+            }
+        )
+    return buckets
+
+
+def _annotate_policy_summary(
+    summary: pd.DataFrame,
+    *,
+    mode: str,
+    window_size: int,
+    top_k: int,
+    run_dir: str,
+    layer_idx: Optional[int] = None,
+    bucket: Optional[Dict] = None,
+) -> pd.DataFrame:
+    out = summary.copy()
+    out.insert(0, "policy_scope", mode)
+    out.insert(1, "window_size", window_size)
+    out.insert(2, "top_k", top_k)
+    out.insert(3, "layer_idx", layer_idx if layer_idx is not None else np.nan)
+    out.insert(4, "user_bucket", bucket["bucket"] if bucket is not None else "")
+    out.insert(5, "run_dir", run_dir)
+    return out
+
+
+def _annotate_policy_by_task(
+    by_task: pd.DataFrame,
+    *,
+    mode: str,
+    window_size: int,
+    top_k: int,
+    run_dir: str,
+    layer_idx: Optional[int] = None,
+    bucket: Optional[Dict] = None,
+) -> pd.DataFrame:
+    out = by_task.copy()
+    out.insert(0, "policy_scope", mode)
+    out.insert(1, "window_size", window_size)
+    out.insert(2, "top_k", top_k)
+    out.insert(3, "layer_idx", layer_idx if layer_idx is not None else np.nan)
+    out.insert(4, "user_bucket", bucket["bucket"] if bucket is not None else "")
+    out.insert(5, "run_dir", run_dir)
+    return out
+
+
+def _mark_policy_pareto(summary: pd.DataFrame, group_cols: List[str]) -> pd.Series:
+    marks = pd.Series(False, index=summary.index)
+    for _, idxs in summary.groupby(group_cols, dropna=False).groups.items():
+        group = summary.loc[list(idxs)]
+        group_marks = []
+        for idx, row in group.iterrows():
+            dominated = False
+            for other_idx, other in group.iterrows():
+                if other_idx == idx:
+                    continue
+                same_or_better = (
+                    other["reuse_ratio_all_tokens"] >= row["reuse_ratio_all_tokens"]
+                    and other["mean_reuse_auc"] >= row["mean_reuse_auc"]
+                )
+                strictly_better = (
+                    other["reuse_ratio_all_tokens"] > row["reuse_ratio_all_tokens"]
+                    or other["mean_reuse_auc"] > row["mean_reuse_auc"]
+                )
+                if same_or_better and strictly_better:
+                    dominated = True
+                    break
+            group_marks.append((idx, not dominated))
+        for idx, mark in group_marks:
+            marks.loc[idx] = mark
+    return marks
+
+
+def _write_policy_grid_outputs(
+    output_dir: str,
+    mode: str,
+    rows: List[pd.DataFrame],
+    by_task_rows: Optional[List[pd.DataFrame]] = None,
+) -> None:
+    if not rows:
+        return
+    summary = pd.concat(rows, ignore_index=True)
+    summary["policy_pareto"] = _mark_policy_pareto(
+        summary,
+        {
+            "global": ["policy_scope"],
+            "layer": ["policy_scope", "layer_idx"],
+            "user_bucket": ["policy_scope", "user_bucket"],
+        }[mode],
+    )
+    prefix = {
+        "global": "policy_grid",
+        "layer": "layer_policy",
+        "user_bucket": "user_bucket_policy",
+    }[mode]
+    summary_path = os.path.join(output_dir, f"{prefix}_auc_summary.csv")
+    pareto_path = os.path.join(output_dir, f"{prefix}_pareto.csv")
+    summary.to_csv(summary_path, index=False)
+    summary[summary["policy_pareto"]].to_csv(pareto_path, index=False)
+    if by_task_rows:
+        by_task = pd.concat(by_task_rows, ignore_index=True)
+        by_task.to_csv(os.path.join(output_dir, f"{prefix}_auc_by_task.csv"), index=False)
+    _plot_policy_grid_auc(summary, output_dir, prefix)
+
+
+def _read_and_annotate_policy_outputs(
+    run_dir: str,
+    *,
+    mode: str,
+    window_size: int,
+    top_k: int,
+    layer_idx: Optional[int] = None,
+    bucket: Optional[Dict] = None,
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    summary_path = os.path.join(run_dir, "reuse_auc_impact_summary_auc_gt_0p6.csv")
+    by_task_path = os.path.join(run_dir, "reuse_auc_impact_by_task.csv")
+    annotated_summary = None
+    annotated_by_task = None
+    if os.path.exists(summary_path):
+        summary = pd.read_csv(summary_path)
+        if not summary.empty:
+            annotated_summary = _annotate_policy_summary(
+                summary,
+                mode=mode,
+                window_size=window_size,
+                top_k=top_k,
+                run_dir=run_dir,
+                layer_idx=layer_idx,
+                bucket=bucket,
+            )
+    if os.path.exists(by_task_path):
+        by_task = pd.read_csv(by_task_path)
+        if not by_task.empty:
+            annotated_by_task = _annotate_policy_by_task(
+                by_task,
+                mode=mode,
+                window_size=window_size,
+                top_k=top_k,
+                run_dir=run_dir,
+                layer_idx=layer_idx,
+                bucket=bucket,
+            )
+    return annotated_summary, annotated_by_task
+
+
+def _load_baseline_metrics_from_by_task(path: str) -> Optional[Dict[str, float]]:
+    if not os.path.exists(path):
+        return None
+    by_task = pd.read_csv(path)
+    if by_task.empty or "metric" not in by_task.columns or "baseline" not in by_task.columns:
+        return None
+    baseline = by_task[["metric", "baseline"]].drop_duplicates("metric")
+    metrics = {
+        str(row["metric"]): float(row["baseline"])
+        for _, row in baseline.iterrows()
+        if not pd.isna(row["baseline"])
+    }
+    return metrics or None
+
+
+def _plot_policy_grid_auc(summary: pd.DataFrame, output_dir: str, prefix: str) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return
+    if summary.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for top_k, group in summary.groupby("top_k"):
+        ax.scatter(
+            group["reuse_ratio_all_tokens"],
+            group["mean_reuse_auc"],
+            s=45,
+            label=f"K={int(top_k)}",
+            alpha=0.8,
+        )
+    pareto = summary[summary["policy_pareto"]]
+    if not pareto.empty:
+        ax.scatter(
+            pareto["reuse_ratio_all_tokens"],
+            pareto["mean_reuse_auc"],
+            s=95,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=1.2,
+            label="Pareto",
+        )
+    ax.set_xlabel("Reuse ratio over all sequence tokens")
+    ax.set_ylabel("Mean filtered AUC")
+    ax.set_title(prefix.replace("_", " ").title())
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{prefix}_auc_reuse_scatter.png"), dpi=160)
+    plt.close(fig)
+
+
+def run_policy_grid_auc_analysis(args, mode: str) -> None:
+    """Run global/layer/user-bucket window-topK AUC grids and aggregate Pareto rows."""
+    if hasattr(base.gin, "clear_config"):
+        base.gin.clear_config()
+    base.gin.parse_config_file(args.gin_config_file)
+
+    trainer_args = base.TrainerArgs()
+    dataset_args, embedding_args = base.get_dataset_and_embedding_args()
+    network_args = base.NetworkArgs()
+    optimizer_args = base.OptimizerArgs()
+    tp_args = base.TensorModelParallelArgs()
+    trainer_args.ckpt_load_dir = args.ckpt_load_dir
+    if args.auc_max_eval_iters is not None:
+        trainer_args.max_eval_iters = args.auc_max_eval_iters
+
+    base.init.initialize_distributed()
+    base.init.initialize_model_parallel(tensor_model_parallel_size=tp_args.tensor_model_parallel_size)
+    base.init.set_random_seed(trainer_args.seed)
+
+    rows: List[pd.DataFrame] = []
+    by_task_rows: List[pd.DataFrame] = []
+    prefix = {
+        "global": "policy_grid",
+        "layer": "layer_policy",
+        "user_bucket": "user_bucket_policy",
+    }[mode]
+    run_root = os.path.join(args.output_dir, f"{prefix}_runs")
+    os.makedirs(run_root, exist_ok=True)
+    grid_window_sizes = list(args.layer_window_sizes) if mode == "layer" else list(args.window_sizes)
+    grid_top_ks = list(args.layer_top_ks) if mode == "layer" else list(args.top_ks)
+
+    try:
+        hstu_config = base.create_hstu_config(network_args, tp_args)
+        is_retrieval = base.is_retrieval_task()
+        if is_retrieval:
+            task_config = base.create_retrieval_config(dataset_args, network_args, embedding_args)
+            model = base.get_retrieval_model(hstu_config=hstu_config, task_config=task_config)
+        else:
+            task_config = base.create_ranking_config(dataset_args, network_args, embedding_args)
+            model = base.get_ranking_model(hstu_config=hstu_config, task_config=task_config)
+
+        dynamic_options_dict = base.create_dynamic_optitons_dict(
+            embedding_args,
+            network_args.hidden_size,
+            training=True,
+            embedding_dim_multiplier=base.get_embedding_vector_storage_multiplier(
+                optimizer_args.optimizer_str
+            ),
+        )
+        optimizer_param = base.create_optimizer_params(optimizer_args)
+        model_train, dense_optimizer = base.make_optimizer_and_shard(
+            model,
+            config=hstu_config,
+            sparse_optimizer_param=optimizer_param,
+            dense_optimizer_param=optimizer_param,
+            dynamicemb_options_dict=dynamic_options_dict,
+            pipeline_type=trainer_args.pipeline_type,
+        )
+
+        if is_retrieval:
+            stateful_metric_module = base.RetrievalTaskMetricWithSampling(
+                metric_types=task_config.eval_metrics,
+                MAX_K=args.max_retrieval_items,
+            )
+            _, eval_dataloader = base.get_data_loader("retrieval", dataset_args, trainer_args, 0)
+        else:
+            stateful_metric_module = base.get_multi_event_metric_module(
+                num_classes=task_config.prediction_head_arch[-1],
+                num_tasks=task_config.num_tasks,
+                metric_types=task_config.eval_metrics,
+                comm_pg=base.parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+            _, eval_dataloader = base.get_data_loader(
+                "ranking", dataset_args, trainer_args, task_config.num_tasks
+            )
+
+        base.maybe_load_ckpts(trainer_args.ckpt_load_dir, model, dense_optimizer)
+        layer_indices = range(hstu_config.num_layers) if mode == "layer" else [None]
+        buckets = _user_length_buckets_from_args(args) if mode == "user_bucket" else [None]
+        baseline_metrics_override = _load_baseline_metrics_from_by_task(
+            os.path.join(args.output_dir, "kv_only_no_reuse_auc_by_task.csv")
+        )
+
+        if mode == "global" and args.auc_kv_replace_implementation == "kv_only":
+            control_dir = os.path.join(run_root, "kv_only_no_reuse")
+            os.makedirs(control_dir, exist_ok=True)
+            control_summary_path = os.path.join(
+                control_dir,
+                "reuse_auc_impact_summary_auc_gt_0p6.csv",
+            )
+            if not os.path.exists(control_summary_path):
+                control_policy = base.TokenKVReusePolicy.from_args(
+                    default_window_size=args.window_sizes[0],
+                    default_top_k=0,
+                    policy_json=json.dumps(
+                        {"default": {"window_size": args.window_sizes[0], "top_k": 0}}
+                    ),
+                )
+                base.run_kv_replace_analysis(
+                    model_train=model_train,
+                    model=model,
+                    eval_dataloader=eval_dataloader,
+                    stateful_metric_module=stateful_metric_module,
+                    trainer_args=trainer_args,
+                    output_dir=control_dir,
+                    reuse_policy=control_policy,
+                    deprecated_similarity_threshold=0.0,
+                    reuse_token_types=["action"],
+                    reuse_strategies=["window_topk_same_id"],
+                    reuse_max_distances=None,
+                    replacement_impl=args.auc_kv_replace_implementation,
+                    report_command=args.report_command,
+                )
+                _write_filtered_auc_summary_and_markdown(
+                    control_dir,
+                    args.auc_filter_baseline_threshold,
+                )
+            control_by_task_path = os.path.join(control_dir, "reuse_auc_impact_by_task.csv")
+            if os.path.exists(control_by_task_path):
+                pd.read_csv(control_by_task_path).to_csv(
+                    os.path.join(args.output_dir, "kv_only_no_reuse_auc_by_task.csv"),
+                    index=False,
+                )
+                baseline_metrics_override = _load_baseline_metrics_from_by_task(
+                    os.path.join(args.output_dir, "kv_only_no_reuse_auc_by_task.csv")
+                )
+            if os.path.exists(control_summary_path):
+                pd.read_csv(control_summary_path).to_csv(
+                    os.path.join(args.output_dir, "kv_only_no_reuse_auc_summary.csv"),
+                    index=False,
+                )
+
+        for layer_idx in layer_indices:
+            for bucket in buckets:
+                for window_size in grid_window_sizes:
+                    for top_k in grid_top_ks:
+                        policy_json = _policy_json_for_grid(
+                            mode=mode,
+                            window_size=window_size,
+                            top_k=top_k,
+                            layer_idx=layer_idx,
+                            bucket=bucket,
+                        )
+                        name_parts = [f"w{window_size}", f"k{top_k}"]
+                        if layer_idx is not None:
+                            name_parts.insert(0, f"layer{layer_idx}")
+                        if bucket is not None:
+                            name_parts.insert(0, f"user_{bucket['bucket'].replace('+', 'plus')}")
+                        run_name = "_".join(name_parts)
+                        run_dir = os.path.join(run_root, run_name)
+                        os.makedirs(run_dir, exist_ok=True)
+                        annotated_summary, annotated_by_task = _read_and_annotate_policy_outputs(
+                            run_dir,
+                            mode=mode,
+                            window_size=window_size,
+                            top_k=top_k,
+                            layer_idx=layer_idx,
+                            bucket=bucket,
+                        )
+                        if annotated_summary is not None:
+                            rows.append(annotated_summary)
+                            if annotated_by_task is not None:
+                                by_task_rows.append(annotated_by_task)
+                            continue
+
+                        reuse_policy = base.TokenKVReusePolicy.from_args(
+                            default_window_size=args.auc_reuse_window_size,
+                            default_top_k=args.auc_reuse_top_k,
+                            policy_json=policy_json,
+                        )
+                        base.run_kv_replace_analysis(
+                            model_train=model_train,
+                            model=model,
+                            eval_dataloader=eval_dataloader,
+                            stateful_metric_module=stateful_metric_module,
+                            trainer_args=trainer_args,
+                            output_dir=run_dir,
+                            reuse_policy=reuse_policy,
+                            deprecated_similarity_threshold=0.0,
+                            reuse_token_types=["action"],
+                            reuse_strategies=["window_topk_same_id"],
+                            reuse_max_distances=None,
+                            replacement_impl=args.auc_kv_replace_implementation,
+                            report_command=args.report_command,
+                            baseline_metrics_override=baseline_metrics_override,
+                        )
+                        _write_filtered_auc_summary_and_markdown(
+                            run_dir,
+                            args.auc_filter_baseline_threshold,
+                        )
+                        annotated_summary, annotated_by_task = _read_and_annotate_policy_outputs(
+                            run_dir,
+                            mode=mode,
+                            window_size=window_size,
+                            top_k=top_k,
+                            layer_idx=layer_idx,
+                            bucket=bucket,
+                        )
+                        if annotated_summary is None:
+                            continue
+                        rows.append(annotated_summary)
+                        if annotated_by_task is not None:
+                            by_task_rows.append(annotated_by_task)
+        _write_policy_grid_outputs(args.output_dir, mode, rows, by_task_rows)
+        _write_motivation_insights_markdown(
+            args.output_dir,
+            auc_summary=pd.DataFrame(),
+            eligible_metrics=[],
+            threshold=args.auc_filter_baseline_threshold,
+        )
+    finally:
+        base.init.destroy_global_state()
+
+
 def _format_pct(value: float) -> str:
+    if value is None or pd.isna(value):
+        return "n/a"
     return f"{value * 100:.2f}%"
 
 
@@ -959,6 +1609,21 @@ def _load_action_same_diff_rollup(output_dir: str) -> Optional[pd.DataFrame]:
 
 
 def _load_action_distance_rollup(output_dir: str) -> Optional[pd.DataFrame]:
+    summary_path = os.path.join(output_dir, "action_kv_same_vs_diff_distance_summary.csv")
+    if os.path.exists(summary_path):
+        summary = pd.read_csv(summary_path)
+        if not summary.empty:
+            if "layer_group" in summary.columns:
+                contextual = summary[summary["layer_group"] == "contextual_layers"]
+                if not contextual.empty:
+                    summary = contextual
+            summary = summary.copy()
+            summary["_distance_sort"] = summary["distance_bucket"].map(_distance_bucket_sort_key)
+            return summary.sort_values(
+                ["same_action", "_distance_sort"],
+                ascending=[False, True],
+            ).drop(columns=["_distance_sort"])
+
     path = os.path.join(output_dir, "action_kv_same_vs_diff_pairs.csv")
     if not os.path.exists(path):
         return None
@@ -969,22 +1634,66 @@ def _load_action_distance_rollup(output_dir: str) -> Optional[pd.DataFrame]:
         df["k_centered_cosine"] = np.nan
     if "v_centered_cosine" not in df.columns:
         df["v_centered_cosine"] = np.nan
-    return (
+    out = (
         df[df["layer_idx"] > 0]
         .groupby(["same_action", "distance_bucket"], sort=False)
         .agg(
             k_cosine_mean=("k_cosine", "mean"),
+            k_cosine_median=("k_cosine", "median"),
+            k_cosine_p10=("k_cosine", lambda x: x.quantile(0.10)),
+            k_cosine_p90=("k_cosine", lambda x: x.quantile(0.90)),
             k_centered_cosine_mean=("k_centered_cosine", "mean"),
             v_cosine_mean=("v_cosine", "mean"),
+            v_cosine_median=("v_cosine", "median"),
+            v_cosine_p10=("v_cosine", lambda x: x.quantile(0.10)),
+            v_cosine_p90=("v_cosine", lambda x: x.quantile(0.90)),
             v_centered_cosine_mean=("v_centered_cosine", "mean"),
             pos_distance_mean=("pos_distance", "mean"),
             pair_count=("k_cosine", "count"),
         )
         .reset_index()
     )
+    out["_distance_sort"] = out["distance_bucket"].map(_distance_bucket_sort_key)
+    return out.sort_values(["same_action", "_distance_sort"], ascending=[False, True]).drop(
+        columns=["_distance_sort"]
+    )
 
 
 def _load_item_action_distance_rollup(output_dir: str) -> Optional[pd.DataFrame]:
+    summary_path = os.path.join(output_dir, "item_action_kv_similarity_summary.csv")
+    if os.path.exists(summary_path):
+        summary = pd.read_csv(summary_path)
+        if summary.empty:
+            return None
+        if "layer_idx" in summary.columns:
+            summary = summary[summary["layer_idx"] > 0]
+        if summary.empty:
+            return None
+
+        def _weighted_rollup(group: pd.DataFrame) -> pd.Series:
+            weights = group["pair_count"].astype(float).clip(lower=0)
+            if weights.sum() <= 0:
+                weights = None
+            return pd.Series(
+                {
+                    "k_cosine_mean": np.average(group["k_cosine_mean"], weights=weights),
+                    "k_centered_cosine_mean": np.average(
+                        group["k_centered_cosine_mean"],
+                        weights=weights,
+                    ),
+                    "v_cosine_mean": np.average(group["v_cosine_mean"], weights=weights),
+                    "pair_count": group["pair_count"].sum(),
+                }
+            )
+
+        out = (
+            summary.groupby(["token_type", "distance_bucket"], sort=False)
+            .apply(_weighted_rollup)
+            .reset_index()
+        )
+        out["_distance_sort"] = out["distance_bucket"].map(_distance_bucket_sort_key)
+        return out.sort_values(["token_type", "_distance_sort"]).drop(columns=["_distance_sort"])
+
     path = os.path.join(output_dir, "item_action_kv_similarity_pairs.csv")
     if not os.path.exists(path):
         return None
@@ -993,7 +1702,7 @@ def _load_item_action_distance_rollup(output_dir: str) -> Optional[pd.DataFrame]
         return None
     if "k_centered_cosine" not in df.columns:
         df["k_centered_cosine"] = np.nan
-    return (
+    out = (
         df[df["layer_idx"] > 0]
         .groupby(["token_type", "distance_bucket"], sort=False)
         .agg(
@@ -1004,6 +1713,8 @@ def _load_item_action_distance_rollup(output_dir: str) -> Optional[pd.DataFrame]
         )
         .reset_index()
     )
+    out["_distance_sort"] = out["distance_bucket"].map(_distance_bucket_sort_key)
+    return out.sort_values(["token_type", "_distance_sort"]).drop(columns=["_distance_sort"])
 
 
 def _load_data_summary(output_dir: str) -> Dict:
@@ -1050,6 +1761,191 @@ def _append_command_block(lines: List[str], commands: Dict[str, str], stage: str
     )
 
 
+def _append_glossary(lines: List[str], entries: Dict[str, str]) -> None:
+    lines.extend(["Variables:", ""])
+    for name, description in entries.items():
+        lines.append(f"- `{name}`: {description}")
+    lines.append("")
+
+
+def _read_csv_if_exists(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    return df if not df.empty else pd.DataFrame()
+
+
+def _append_not_run(lines: List[str], output_name: str) -> None:
+    lines.extend(
+        [
+            f"`{output_name}` was not generated in this run.",
+            "",
+        ]
+    )
+
+
+def _recommend_policy_rows(df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, group in df.groupby(group_cols, dropna=False):
+        safe = group[group["max_auc_drop"] <= 0.001]
+        source = safe if not safe.empty else group[group["policy_pareto"]]
+        if source.empty:
+            source = group
+        rows.append(
+            source.sort_values(
+                ["reuse_ratio_all_tokens", "mean_reuse_auc"],
+                ascending=[False, False],
+            ).iloc[0]
+        )
+    return pd.DataFrame(rows)
+
+
+def _append_policy_grid_section(
+    *,
+    lines: List[str],
+    commands: Dict[str, str],
+    output_dir: str,
+    title: str,
+    stage: str,
+    summary_file: str,
+    pareto_file: str,
+    group_cols: List[str],
+    question_text: str,
+) -> None:
+    lines.extend([f"## {title}", "", question_text, ""])
+    _append_command_block(lines, commands, stage)
+    _append_glossary(
+        lines,
+        {
+            "window_size": "Interleaved-token window size used by action KV reuse.",
+            "top_k": "Number of high-frequency action ids reused per user/window/layer.",
+            "reuse_ratio_all_tokens": "Replaced action KV rows divided by all sequence tokens; higher means more compute/cache saved.",
+            "mean_reuse_auc": "Mean AUC after KV reuse, filtered to tasks whose baseline AUC is above the configured threshold.",
+            "mean_auc_diff": "Mean AUC change relative to no-reuse baseline.",
+            "max_auc_drop": "Worst AUC drop among filtered tasks; lower is safer.",
+            "policy_pareto": "True if no other point has both higher/equal reuse ratio and higher/equal AUC.",
+        },
+    )
+    summary = _read_csv_if_exists(os.path.join(output_dir, summary_file))
+    pareto = _read_csv_if_exists(os.path.join(output_dir, pareto_file))
+    if summary.empty:
+        _append_not_run(lines, summary_file)
+        return
+    prefix = summary_file.replace("_auc_summary.csv", "")
+    by_task_file = f"{prefix}_auc_by_task.csv"
+    by_task = _read_csv_if_exists(os.path.join(output_dir, by_task_file))
+
+    if not by_task.empty:
+        baseline_tasks = (
+            by_task[["metric", "baseline"]]
+            .drop_duplicates()
+            .sort_values("metric")
+        )
+        lines.extend(["All-task baseline AUC used by this grid:", ""])
+        lines.append("| Metric | Baseline AUC | Included In Pareto |")
+        lines.append("|---|---:|---:|")
+        for _, row in baseline_tasks.iterrows():
+            included = row["baseline"] > 0.6
+            lines.append(
+                f"| {row['metric']} | {row['baseline']:.6f} | "
+                f"{'yes' if included else 'no'} |"
+            )
+        lines.append("")
+
+    if stage == "policy_grid_auc_analysis":
+        control = _read_csv_if_exists(os.path.join(output_dir, "kv_only_no_reuse_auc_by_task.csv"))
+        if not control.empty:
+            lines.extend(["KV-only no-reuse sanity check:", ""])
+            lines.append("| Metric | Original Baseline | KV-only No-Reuse | Diff |")
+            lines.append("|---|---:|---:|---:|")
+            for _, row in control.sort_values("metric").iterrows():
+                lines.append(
+                    f"| {row['metric']} | {row['baseline']:.6f} | "
+                    f"{row['kv_replaced']:.6f} | {row['diff']:+.6f} |"
+                )
+            lines.append("")
+
+    recommended = _recommend_policy_rows(summary, group_cols)
+    if not recommended.empty:
+        display_cols = [
+            col
+            for col in [
+                *group_cols,
+                "window_size",
+                "top_k",
+                "reuse_ratio_all_tokens",
+                "mean_reuse_auc",
+                "mean_auc_diff",
+                "max_auc_drop",
+            ]
+            if col in recommended.columns
+        ]
+        lines.extend(["Recommended operating points:", ""])
+        lines.append("| " + " | ".join(display_cols) + " |")
+        lines.append("|" + "|".join(["---"] * len(display_cols)) + "|")
+        for _, row in recommended[display_cols].iterrows():
+            values = []
+            for col in display_cols:
+                value = row[col]
+                if col == "reuse_ratio_all_tokens":
+                    values.append(_format_pct(value))
+                elif col in {"mean_reuse_auc", "mean_auc_diff", "max_auc_drop"}:
+                    values.append(f"{value:.6f}")
+                elif pd.isna(value):
+                    values.append("-")
+                else:
+                    values.append(str(int(value)) if isinstance(value, (float, np.floating)) and value.is_integer() else str(value))
+            lines.append("| " + " | ".join(values) + " |")
+        lines.append("")
+
+    if not pareto.empty:
+        pareto = pareto.sort_values(["reuse_ratio_all_tokens", "mean_reuse_auc"], ascending=[False, False])
+        pareto = pareto.head(12)
+        display_cols = [
+            col
+            for col in [
+                *group_cols,
+                "window_size",
+                "top_k",
+                "reuse_ratio_all_tokens",
+                "mean_reuse_auc",
+                "mean_auc_diff",
+                "max_auc_drop",
+            ]
+            if col in pareto.columns
+        ]
+        lines.extend(["Pareto frontier preview:", ""])
+        lines.append("| " + " | ".join(display_cols) + " |")
+        lines.append("|" + "|".join(["---"] * len(display_cols)) + "|")
+        for _, row in pareto[display_cols].iterrows():
+            values = []
+            for col in display_cols:
+                value = row[col]
+                if col == "reuse_ratio_all_tokens":
+                    values.append(_format_pct(value))
+                elif col in {"mean_reuse_auc", "mean_auc_diff", "max_auc_drop"}:
+                    values.append(f"{value:.6f}")
+                elif pd.isna(value):
+                    values.append("-")
+                else:
+                    values.append(str(int(value)) if isinstance(value, (float, np.floating)) and value.is_integer() else str(value))
+            lines.append("| " + " | ".join(values) + " |")
+        lines.append("")
+
+    scatter = f"{prefix}_auc_reuse_scatter.png"
+    lines.extend(
+        [
+            f"Full table: `{summary_file}`",
+            f"All-task AUC table: `{by_task_file}`",
+            f"Pareto table: `{pareto_file}`",
+            f"Scatter plot: `{scatter}`",
+            "",
+        ]
+    )
+
+
 def _write_motivation_insights_markdown(
     output_dir: str,
     auc_summary: pd.DataFrame,
@@ -1058,24 +1954,31 @@ def _write_motivation_insights_markdown(
 ) -> None:
     data_summary = _load_data_summary(output_dir)
     report_commands = _load_report_commands(output_dir)
-    action_rollup = _load_action_same_diff_rollup(output_dir)
     action_distance = _load_action_distance_rollup(output_dir)
     item_action_distance = _load_item_action_distance_rollup(output_dir)
 
     lines = [
-        "# Action KV Reuse Motivation Insights",
+        "# Action KV Reuse Motivation Report",
         "",
-        "## Takeaway",
+        "This report is organized around the five questions needed to motivate and tune action KV reuse.",
         "",
-        "GR KV reuse should be constrained to token types and positions where the hidden semantics stay close. "
-        "The evidence below says action tokens are the right target: their id space is small, repeated actions have high real-KV similarity, and AUC degrades when reuse ignores semantic id or distance.",
+        "Definitions used throughout: AUC summaries only include tasks whose baseline AUC is above the configured threshold; Pareto optimality is computed in the reuse-ratio vs AUC plane.",
         "",
     ]
 
     token_space = data_summary.get("token_space", []) if data_summary else []
+    lines.extend(["## Q1. Why Is Action Better Than Item For Reuse?", ""])
+    _append_command_block(lines, report_commands, "data_analysis")
+    _append_glossary(
+        lines,
+        {
+            "global_unique_ids": "Number of distinct ids in the whole analyzed dataset.",
+            "mean_user_unique_ids": "Average number of distinct ids per user sequence.",
+            "mean_user_top1_share": "Average fraction of a user's tokens covered by their most frequent id.",
+            "mean_user_top3_share": "Average fraction covered by their three most frequent ids.",
+        },
+    )
     if token_space:
-        lines.extend(["## Token Space", ""])
-        _append_command_block(lines, report_commands, "data_analysis")
         lines.extend(
             [
                 "| Token Type | Global Unique IDs | Mean User Unique IDs | Mean User Top-1 Share | Mean User Top-3 Share |",
@@ -1096,34 +1999,29 @@ def _write_motivation_insights_markdown(
                 "",
             ]
         )
+    else:
+        _append_not_run(lines, "token_space_summary.csv")
 
-    if action_rollup is not None and set(action_rollup["same_action"]) == {False, True}:
-        same = action_rollup[action_rollup["same_action"] == True].iloc[0]
-        diff = action_rollup[action_rollup["same_action"] == False].iloc[0]
-        lines.extend(["## Real KV Similarity", ""])
-        _append_command_block(lines, report_commands, "kv_analysis")
-        lines.extend(
-            [
-                "| Action Pair | K Cosine Mean | V Cosine Mean | Pair Count |",
-                "|---|---:|---:|---:|",
-                f"| Same action | {same['k_cosine_mean']:.4f} | {same['v_cosine_mean']:.4f} | {int(same['pair_count']):,} |",
-                f"| Different action | {diff['k_cosine_mean']:.4f} | {diff['v_cosine_mean']:.4f} | {int(diff['pair_count']):,} |",
-                f"| Same - Different | {same['k_cosine_mean'] - diff['k_cosine_mean']:+.4f} | {same['v_cosine_mean'] - diff['v_cosine_mean']:+.4f} |  |",
-                "",
-                "Insight: KV vectors are much more consistent when the action id is the same. This is the direct evidence that action identity carries reusable KV structure.",
-                "",
-            ]
-        )
-
+    lines.extend(["## Q2. How Similar Is Action KV At Different Distances?", ""])
     if action_distance is not None and not action_distance.empty:
-        lines.extend(["## KV Similarity vs Distance", ""])
         _append_command_block(lines, report_commands, "kv_analysis")
+        _append_glossary(
+            lines,
+            {
+                "same action": "Both KV rows come from the same action id in the same user sequence.",
+                "different action": "The two KV rows come from different action ids in the same user sequence.",
+                "distance_bucket": "Interleaved-token distance between the two positions.",
+                "K/V Cosine": "Mean cosine similarity of projected K or V vectors.",
+                "P10/P90": "10th/90th percentile; these expose tail behavior hidden by the mean.",
+                "pair_count": "Number of sampled pairs in this bucket.",
+            },
+        )
         lines.extend(
             [
-                "Layer 0 is excluded in this distance view so the trend reflects contextual HSTU layers rather than raw embedding identity.",
+                "Layer 0 is excluded here so the trend reflects contextual HSTU layers rather than raw embedding identity.",
                 "",
-                "| Pair Type | Distance Bucket | Mean Distance | K Cosine | K Centered Cosine | V Cosine | Pair Count |",
-                "|---|---:|---:|---:|---:|---:|---:|",
+                "| Pair Type | Distance Bucket | Mean Distance | K Cosine | K P10 | K P90 | K Centered | V Cosine | V P10 | V P90 | Pair Count |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         display = action_distance.copy()
@@ -1131,14 +2029,53 @@ def _write_motivation_insights_markdown(
         for _, row in display.iterrows():
             lines.append(
                 f"| {row['pair_type']} | {row['distance_bucket']} | {row['pos_distance_mean']:.1f} | "
-                f"{row['k_cosine_mean']:.4f} | {row['k_centered_cosine_mean']:.4f} | "
-                f"{row['v_cosine_mean']:.4f} | {int(row['pair_count']):,} |"
+                f"{row['k_cosine_mean']:.4f} | {row.get('k_cosine_p10', np.nan):.4f} | "
+                f"{row.get('k_cosine_p90', np.nan):.4f} | {row['k_centered_cosine_mean']:.4f} | "
+                f"{row['v_cosine_mean']:.4f} | {row.get('v_cosine_p10', np.nan):.4f} | "
+                f"{row.get('v_cosine_p90', np.nan):.4f} | {int(row['pair_count']):,} |"
             )
+
+        pivot = display.pivot_table(
+            index="distance_bucket",
+            columns="same_action",
+            values=["k_cosine_mean", "v_cosine_mean", "pair_count"],
+            aggfunc="first",
+        )
+        if True in pivot.get("k_cosine_mean", {}) and False in pivot.get("k_cosine_mean", {}):
+            pivot = pivot.loc[sorted(pivot.index, key=_distance_bucket_sort_key)]
+            lines.extend(
+                [
+                    "",
+                    "| Distance Bucket | K Same-Diff Gap | V Same-Diff Gap | Same Pairs | Different Pairs |",
+                    "|---|---:|---:|---:|---:|",
+                ]
+            )
+            for bucket in pivot.index:
+                k_same = pivot[("k_cosine_mean", True)].get(bucket, np.nan)
+                k_diff = pivot[("k_cosine_mean", False)].get(bucket, np.nan)
+                v_same = pivot[("v_cosine_mean", True)].get(bucket, np.nan)
+                v_diff = pivot[("v_cosine_mean", False)].get(bucket, np.nan)
+                same_count = pivot[("pair_count", True)].get(bucket, np.nan)
+                diff_count = pivot[("pair_count", False)].get(bucket, np.nan)
+                lines.append(
+                    f"| {bucket} | {k_same - k_diff:+.4f} | {v_same - v_diff:+.4f} | "
+                    f"{int(same_count) if not pd.isna(same_count) else 0:,} | "
+                    f"{int(diff_count) if not pd.isna(diff_count) else 0:,} |"
+                )
+        lines.extend(
+            [
+                "",
+                "Insight: action identity is reusable mainly as a local signal: same-action KV is much closer than different-action KV in short-distance buckets, while the distance trend explains why an unbounded global action cache is not the right motivation.",
+                "",
+            ]
+        )
         if item_action_distance is not None and not item_action_distance.empty:
             lines.extend(
                 [
                     "",
-                    "| Same-ID Token Type | Distance Bucket | K Cosine | K Centered Cosine | V Cosine | Pair Count |",
+                    "Same-id action/item comparison, using the same distance buckets:",
+                    "",
+                    "| Same-ID Token Type | Distance Bucket | K Cosine | K Centered | V Cosine | Pair Count |",
                     "|---|---:|---:|---:|---:|---:|",
                 ]
             )
@@ -1148,18 +2085,63 @@ def _write_motivation_insights_markdown(
                     f"{row['k_cosine_mean']:.4f} | {row['k_centered_cosine_mean']:.4f} | "
                     f"{row['v_cosine_mean']:.4f} | {int(row['pair_count']):,} |"
                 )
+            lines.append("")
         lines.extend(
             [
-                "",
-                "Insight: same-action KV remains far closer than different-action KV, but distance still matters; this motivates a local window instead of one unbounded action cache.",
+                "Distribution plots:",
+                "- `action_kv_same_vs_diff_by_layer.png`",
+                "- `item_action_kv_similarity_boxplot.png`",
+                "- `item_vs_action_kv_similarity_by_distance.png`",
                 "",
             ]
         )
+    else:
+        _append_not_run(lines, "action_kv_same_vs_diff_distance_summary.csv")
+
+    _append_policy_grid_section(
+        lines=lines,
+        commands=report_commands,
+        output_dir=output_dir,
+        title="Q3. Which Global Top-K/Window Points Are Pareto Optimal?",
+        stage="policy_grid_auc_analysis",
+        summary_file="policy_grid_auc_summary.csv",
+        pareto_file="policy_grid_pareto.csv",
+        group_cols=["policy_scope"],
+        question_text="This grid answers how top-K and window size trade reuse ratio against final inference AUC.",
+    )
+
+    _append_policy_grid_section(
+        lines=lines,
+        commands=report_commands,
+        output_dir=output_dir,
+        title="Q4. Which Layers Are Most Sensitive?",
+        stage="layer_policy_auc_analysis",
+        summary_file="layer_policy_auc_summary.csv",
+        pareto_file="layer_policy_pareto.csv",
+        group_cols=["layer_idx"],
+        question_text=(
+            "Each run enables reuse in one HSTU layer only. By default this uses "
+            "top_k=1 and window_size=64, so the table isolates layer sensitivity "
+            "without running a full top-K/window grid for every layer."
+        ),
+    )
+
+    _append_policy_grid_section(
+        lines=lines,
+        commands=report_commands,
+        output_dir=output_dir,
+        title="Q5. How Should Top-K/Window Be Chosen For Different Users?",
+        stage="user_bucket_policy_auc_analysis",
+        summary_file="user_bucket_policy_auc_summary.csv",
+        pareto_file="user_bucket_policy_pareto.csv",
+        group_cols=["user_bucket"],
+        question_text="Each run enables reuse for one user sequence-length bucket only, which estimates the best policy for short vs long users.",
+    )
 
     if data_summary:
         action_conc = data_summary.get("action_concentration", {})
         default_policy = data_summary.get("default_512_top3_policy", {})
-        lines.extend(["## Reuse Opportunity", ""])
+        lines.extend(["## Dataset-Only Reuse Opportunity Reference", ""])
         _append_command_block(lines, report_commands, "data_analysis")
         lines.extend(
             [
@@ -1177,7 +2159,7 @@ def _write_motivation_insights_markdown(
 
     if not auc_summary.empty:
         display = auc_summary.sort_values(["reuse_ratio_all_tokens", "mean_reuse_auc"])
-        lines.extend(["## AUC vs Reuse", ""])
+        lines.extend(["## Legacy/Strategy AUC Controls", ""])
         _append_command_block(lines, report_commands, "auc_impact_analysis")
         lines.extend(
             [
@@ -1208,11 +2190,12 @@ def _write_motivation_insights_markdown(
                 "",
                 "Insight: the legacy first-action and wrong-action rows are negative controls: high replacement without semantic or distance constraints can damage ranking quality. The distance sweep shows how much locality is needed before reuse becomes low-risk.",
                 "",
-                "## Conclusion",
-                "",
-                "Action KV reuse is motivated by three facts: action ids have a much smaller reuse space than item ids, same-action KV stays substantially closer than the controls, and AUC risk grows when reuse ignores action identity or position distance. The method should be presented as constrained action reuse, not generic KV sharing.",
+                "These controls are useful for explaining what not to do, but Q3-Q5 are the policy-selection sections.",
             ]
         )
 
+    report_text = "\n".join(lines) + "\n"
+    with open(os.path.join(output_dir, "MOTIVATION_REPORT.md"), "w", encoding="utf-8") as f:
+        f.write(report_text)
     with open(os.path.join(output_dir, "MOTIVATION_INSIGHTS.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write(report_text)
