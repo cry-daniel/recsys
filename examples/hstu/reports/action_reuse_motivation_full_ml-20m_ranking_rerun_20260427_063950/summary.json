@@ -1,0 +1,101 @@
+{
+  "seq_file": "tmp_data//ml-20m/processed_seqs.csv",
+  "item_feature_name": "movie_id",
+  "action_feature_name": "rating",
+  "num_users": 138493,
+  "action_concentration": {
+    "mean_top1_share": 0.381967762419838,
+    "median_top1_share": 0.3684210526315789,
+    "p95_top1_share": 0.5949367088607594,
+    "mean_top3_share": 0.8023400427656431,
+    "median_top3_share": 0.8207547169811321,
+    "mean_hhi": 0.27604021252183064,
+    "mean_entropy": 2.151583164082949
+  },
+  "token_space": [
+    {
+      "token_type": "item",
+      "num_users": 138493,
+      "token_count": 20000263,
+      "global_unique_ids": 26744,
+      "global_repeat_rate": 0.9986628175839488,
+      "mean_user_unique_ids": 144.4135299257002,
+      "mean_user_unique_ratio": 1.0,
+      "mean_user_top1_share": 0.018690050375977096,
+      "mean_user_top2_share": 0.03738010075195419,
+      "mean_user_top3_share": 0.05607015112793128,
+      "mean_user_top4_share": 0.07476020150390839,
+      "mean_user_top5_share": 0.09345025187988547
+    },
+    {
+      "token_type": "action",
+      "num_users": 138493,
+      "token_count": 20000263,
+      "global_unique_ids": 10,
+      "global_repeat_rate": 0.9999995000065749,
+      "mean_user_unique_ids": 6.369664892810467,
+      "mean_user_unique_ratio": 0.10776772379162043,
+      "mean_user_top1_share": 0.381967762419838,
+      "mean_user_top2_share": 0.6368776209921067,
+      "mean_user_top3_share": 0.8023400427656431,
+      "mean_user_top4_share": 0.8923398959705204,
+      "mean_user_top5_share": 0.9440533476910944
+    }
+  ],
+  "default_512_top3_policy": {
+    "window_size": 512.0,
+    "top_k": 3.0,
+    "num_users": 138493.0,
+    "action_tokens": 20000263.0,
+    "selected_tokens": 15499305.0,
+    "candidate_tokens": 14981622.0,
+    "selected_action_types": 517683.0,
+    "unique_selected_refs": 517683.0,
+    "total_windows": 173014.0,
+    "eligible_windows": 173014.0,
+    "coverage": 0.7749550593409696,
+    "candidate_rate": 0.7490712497130663,
+    "kv_storage_reduction_est": 0.7490712497130663,
+    "mean_selected_action_types_per_window": 2.992145144323581,
+    "mean_unique_actions_per_window": 6.471545655264892
+  },
+  "best_coverage_policy": [
+    {
+      "window_size": 64,
+      "top_k": 5,
+      "num_users": 138493,
+      "action_tokens": 20000263,
+      "selected_tokens": 19063830,
+      "candidate_tokens": 15987636,
+      "selected_action_types": 3076194,
+      "unique_selected_refs": 3076194,
+      "total_windows": 688220,
+      "eligible_windows": 688220,
+      "coverage": 0.9531789656966011,
+      "candidate_rate": 0.7993712882675593,
+      "kv_storage_reduction_est": 0.7993712882675593,
+      "mean_selected_action_types_per_window": 4.469782918252884,
+      "mean_unique_actions_per_window": 5.418690244398594
+    }
+  ],
+  "best_candidate_rate_policy": [
+    {
+      "window_size": 1024,
+      "top_k": 5,
+      "num_users": 138493,
+      "action_tokens": 20000263,
+      "selected_tokens": 18533270,
+      "candidate_tokens": 17827718,
+      "selected_action_types": 705552,
+      "unique_selected_refs": 705552,
+      "total_windows": 148377,
+      "eligible_windows": 148377,
+      "coverage": 0.9266513145352139,
+      "candidate_rate": 0.8913741784295537,
+      "kv_storage_reduction_est": 0.8913741784295537,
+      "mean_selected_action_types_per_window": 4.75513051214137,
+      "mean_unique_actions_per_window": 6.4345821791787134
+    }
+  ],
+  "global_vs_window_risk": []
+}

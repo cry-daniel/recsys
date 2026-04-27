@@ -8,6 +8,8 @@ with `--run-kv-analysis`, keeping the default data-side path lightweight.
 
 import json
 import os
+import re
+import shutil
 from itertools import combinations, islice
 from typing import Dict, List, Optional, Tuple
 
@@ -251,16 +253,43 @@ def _cap_action_pair_specs_by_distance_bucket(
     return capped
 
 
+def _as_head_matrix(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.float()
+    if tensor.ndim == 1:
+        return tensor.reshape(1, -1)
+    if tensor.ndim == 2:
+        return tensor
+    return tensor.reshape(tensor.shape[0], -1)
+
+
+def _cksim(left: torch.Tensor, right: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    left = _as_head_matrix(left)
+    right = _as_head_matrix(right)
+    dot = (left * right).sum(dim=-1)
+    denom = left.norm(dim=-1) * right.norm(dim=-1) + eps
+    return (dot / denom).mean()
+
+
+def _centered_cksim(left: torch.Tensor, right: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    left = _as_head_matrix(left)
+    right = _as_head_matrix(right)
+    left = left - left.mean(dim=-1, keepdim=True)
+    right = right - right.mean(dim=-1, keepdim=True)
+    dot = (left * right).sum(dim=-1)
+    denom = left.norm(dim=-1) * right.norm(dim=-1) + eps
+    return (dot / denom).mean()
+
+
 def _pair_metrics(left: torch.Tensor, right: torch.Tensor) -> Dict[str, float]:
-    left = left.reshape(1, -1).float()
-    right = right.reshape(1, -1).float()
-    left_centered = left - left.mean(dim=1, keepdim=True)
-    right_centered = right - right.mean(dim=1, keepdim=True)
-    avg_norm = 0.5 * (left.norm(dim=1) + right.norm(dim=1)).clamp_min(1e-12)
+    left_heads = _as_head_matrix(left)
+    right_heads = _as_head_matrix(right)
+    left_flat = left_heads.reshape(1, -1)
+    right_flat = right_heads.reshape(1, -1)
+    avg_norm = 0.5 * (left_flat.norm(dim=1) + right_flat.norm(dim=1)).clamp_min(1e-12)
     return {
-        "cosine": F.cosine_similarity(left, right).item(),
-        "centered_cosine": F.cosine_similarity(left_centered, right_centered).item(),
-        "relative_l2": ((left - right).norm(dim=1) / avg_norm).item(),
+        "cosine": _cksim(left_heads, right_heads).item(),
+        "centered_cosine": _centered_cksim(left_heads, right_heads).item(),
+        "relative_l2": ((left_flat - right_flat).norm(dim=1) / avg_norm).item(),
     }
 
 
@@ -326,7 +355,8 @@ def _records_to_pair_frame(
     records: List[Dict],
     window_size: int,
     distance_buckets,
-    max_tokens_per_user: int,
+    max_items_per_user: int,
+    max_actions_per_user: int,
     max_pairs_per_token_id: int = 0,
     max_pairs_per_distance_bucket: int = 0,
 ) -> pd.DataFrame:
@@ -356,7 +386,7 @@ def _records_to_pair_frame(
                     contextual_len=contextual_len,
                     action_item_span=action_item_span,
                     key_len=key.shape[0],
-                    max_tokens_per_user=max_tokens_per_user,
+                    max_tokens_per_user=max_items_per_user,
                 )
             )
             token_refs.extend(
@@ -368,7 +398,7 @@ def _records_to_pair_frame(
                     contextual_len=contextual_len,
                     action_item_span=action_item_span,
                     key_len=key.shape[0],
-                    max_tokens_per_user=max_tokens_per_user,
+                    max_tokens_per_user=max_actions_per_user,
                 )
             )
 
@@ -430,6 +460,31 @@ def _sample_different_action_pairs(
         left = refs[int(left_idx)]
         right = refs[int(right_idx)]
         if left["token_id"] == right["token_id"]:
+            continue
+        if left["local_pos"] > right["local_pos"]:
+            left, right = right, left
+        pairs.append((left, right))
+    return pairs
+
+
+def _sample_different_token_pairs(
+    refs: List[Dict],
+    max_pairs: int,
+    rng: np.random.Generator,
+) -> List[tuple]:
+    if len(refs) < 2 or max_pairs <= 0:
+        return []
+    pairs = []
+    attempts = 0
+    max_attempts = max_pairs * 20
+    while len(pairs) < max_pairs and attempts < max_attempts:
+        attempts += 1
+        left_idx, right_idx = rng.choice(len(refs), size=2, replace=False)
+        left = refs[int(left_idx)]
+        right = refs[int(right_idx)]
+        left_identity = (left["token_type"], left["token_id"])
+        right_identity = (right["token_type"], right["token_id"])
+        if left_identity == right_identity:
             continue
         if left["local_pos"] > right["local_pos"]:
             left, right = right, left
@@ -523,6 +578,97 @@ def _records_to_action_same_diff_pair_frame(
     return pd.DataFrame(rows)
 
 
+def _records_to_random_different_token_pair_frame(
+    records: List[Dict],
+    window_size: int,
+    distance_buckets,
+    max_items_per_user: int,
+    max_actions_per_user: int,
+    max_pairs_per_user: int,
+    max_pairs_per_distance_bucket: int,
+    random_seed: int = 2025,
+) -> pd.DataFrame:
+    rows = []
+    rng = np.random.default_rng(random_seed + 17)
+    for record in records:
+        key = record["key"]
+        value = record["value"]
+        seqlen_offsets = record["seqlen_offsets"]
+        contextual = record["contextual_seqlen"]
+        item_ids = record["item_ids"]
+        action_ids = record["action_ids"]
+        item_offset = 0
+        action_offset = 0
+        for user_idx in range(len(seqlen_offsets) - 1):
+            seq_start = int(seqlen_offsets[user_idx].item())
+            seq_end = int(seqlen_offsets[user_idx + 1].item())
+            contextual_len = int(contextual[user_idx].item()) if contextual is not None else 0
+            action_item_span = max(0, seq_end - seq_start - contextual_len)
+            token_refs = []
+            token_refs.extend(
+                _collect_token_refs(
+                    token_type="item",
+                    token_ids=item_ids,
+                    token_offset=item_offset,
+                    seq_start=seq_start,
+                    contextual_len=contextual_len,
+                    action_item_span=action_item_span,
+                    key_len=key.shape[0],
+                    max_tokens_per_user=max_items_per_user,
+                )
+            )
+            token_refs.extend(
+                _collect_token_refs(
+                    token_type="action",
+                    token_ids=action_ids,
+                    token_offset=action_offset,
+                    seq_start=seq_start,
+                    contextual_len=contextual_len,
+                    action_item_span=action_item_span,
+                    key_len=key.shape[0],
+                    max_tokens_per_user=max_actions_per_user,
+                )
+            )
+            pairs = _sample_different_token_pairs(token_refs, max_pairs_per_user, rng)
+            pairs = _cap_pairs_by_distance_bucket(
+                pairs,
+                distance_buckets=distance_buckets,
+                max_pairs_per_distance_bucket=max_pairs_per_distance_bucket,
+            )
+            for left, right in pairs:
+                same_window = (left["local_pos"] // window_size) == (
+                    right["local_pos"] // window_size
+                )
+                pos_distance = right["local_pos"] - left["local_pos"]
+                k_metrics = _pair_metrics(key[left["abs_pos"]], key[right["abs_pos"]])
+                v_metrics = _pair_metrics(value[left["abs_pos"]], value[right["abs_pos"]])
+                rows.append(
+                    {
+                        "batch_idx": record["batch_idx"],
+                        "layer_idx": record["layer_idx"],
+                        "user_idx": user_idx,
+                        "token_type_i": left["token_type"],
+                        "token_type_j": right["token_type"],
+                        "token_id_i": left["token_id"],
+                        "token_id_j": right["token_id"],
+                        "pos_i": left["local_pos"],
+                        "pos_j": right["local_pos"],
+                        "pos_distance": pos_distance,
+                        "distance_bucket": _distance_bucket(pos_distance, distance_buckets),
+                        "same_window": same_window,
+                        "k_cosine": k_metrics["cosine"],
+                        "k_centered_cosine": k_metrics["centered_cosine"],
+                        "k_relative_l2": k_metrics["relative_l2"],
+                        "v_cosine": v_metrics["cosine"],
+                        "v_centered_cosine": v_metrics["centered_cosine"],
+                        "v_relative_l2": v_metrics["relative_l2"],
+                    }
+                )
+            item_offset += (action_item_span + 1) // 2
+            action_offset += action_item_span // 2
+    return pd.DataFrame(rows)
+
+
 def _build_action_same_diff_summary(pair_df: pd.DataFrame) -> pd.DataFrame:
     if pair_df.empty:
         return pd.DataFrame()
@@ -594,7 +740,75 @@ def _build_action_same_diff_distance_summary(pair_df: pd.DataFrame) -> pd.DataFr
     return out
 
 
-def _plot_action_same_diff_outputs(pair_df: pd.DataFrame, output_dir: str) -> None:
+def _build_identity_baselines_by_layer_summary(
+    action_same_diff_df: pd.DataFrame,
+    item_action_pair_df: pd.DataFrame,
+    random_token_df: pd.DataFrame,
+) -> pd.DataFrame:
+    parts = []
+    if not action_same_diff_df.empty:
+        action_summary = (
+            action_same_diff_df.groupby(["same_action", "layer_idx"])["k_cosine"]
+            .agg(k_cosine_mean="mean", pair_count="count")
+            .reset_index()
+        )
+        action_summary["baseline"] = action_summary["same_action"].map(
+            {True: "same_action=True", False: "same_action=False"}
+        )
+        parts.append(action_summary[["baseline", "layer_idx", "k_cosine_mean", "pair_count"]])
+
+    if not item_action_pair_df.empty:
+        item_pairs = item_action_pair_df[item_action_pair_df["token_type"] == "item"]
+        if not item_pairs.empty:
+            item_summary = (
+                item_pairs.groupby("layer_idx")["k_cosine"]
+                .agg(k_cosine_mean="mean", pair_count="count")
+                .reset_index()
+            )
+            item_summary["baseline"] = "same_item=True"
+            parts.append(item_summary[["baseline", "layer_idx", "k_cosine_mean", "pair_count"]])
+
+    if not random_token_df.empty:
+        random_summary = (
+            random_token_df.groupby("layer_idx")["k_cosine"]
+            .agg(k_cosine_mean="mean", pair_count="count")
+            .reset_index()
+        )
+        random_summary["baseline"] = "random_different_token"
+        parts.append(random_summary[["baseline", "layer_idx", "k_cosine_mean", "pair_count"]])
+
+    order = {
+        "same_action=True": 0,
+        "same_action=False": 1,
+        "same_item=True": 2,
+        "random_different_token": 3,
+    }
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    layers = sorted(out["layer_idx"].dropna().unique())
+    missing_parts = []
+    existing = set(out["baseline"].unique())
+    for baseline in order:
+        if baseline in existing:
+            continue
+        missing_parts.append(
+            pd.DataFrame(
+                {
+                    "baseline": baseline,
+                    "layer_idx": layers,
+                    "k_cosine_mean": np.nan,
+                    "pair_count": 0,
+                }
+            )
+        )
+    if missing_parts:
+        out = pd.concat([out, *missing_parts], ignore_index=True)
+    out["_baseline_sort"] = out["baseline"].map(order).fillna(len(order))
+    return out.sort_values(["_baseline_sort", "layer_idx"]).drop(columns=["_baseline_sort"])
+
+
+def _plot_identity_baselines_by_layer(summary_df: pd.DataFrame, output_dir: str) -> None:
     try:
         import matplotlib
 
@@ -602,25 +816,20 @@ def _plot_action_same_diff_outputs(pair_df: pd.DataFrame, output_dir: str) -> No
         import matplotlib.pyplot as plt
     except ModuleNotFoundError:
         return
-    if pair_df.empty:
+    if summary_df.empty:
         return
 
-    layer_summary = (
-        pair_df.groupby(["same_action", "layer_idx"])["k_cosine"]
-        .mean()
-        .reset_index()
-    )
     fig, ax = plt.subplots(figsize=(10, 5))
-    for same_action, group in layer_summary.groupby("same_action"):
+    for baseline, group in summary_df.groupby("baseline", sort=False):
         ax.plot(
             group["layer_idx"],
-            group["k_cosine"],
+            group["k_cosine_mean"],
             marker="o",
-            label=f"same_action={same_action}",
+            label=baseline,
         )
-    ax.set_title("Action K cosine: same action vs different action")
+    ax.set_title("K CKSim identity baselines by layer")
     ax.set_xlabel("Layer")
-    ax.set_ylabel("Mean K cosine")
+    ax.set_ylabel("Mean K CKSim")
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
@@ -720,9 +929,17 @@ def _plot_kv_outputs(pair_df: pd.DataFrame, summary_df: pd.DataFrame, output_dir
         return
     fig, ax = plt.subplots(figsize=(8, 5))
     pair_df.boxplot(column="k_cosine", by=["token_type", "same_window"], ax=ax, rot=30)
-    ax.set_title("K cosine: item/action same-token pairs")
-    ax.set_xlabel("token_type, same_window")
-    ax.set_ylabel("K cosine")
+    ax.set_title("Same-ID K CKSim distribution")
+    ax.set_xlabel("Token type and whether both positions are in the same window")
+    ax.set_ylabel("K CKSim")
+    # ax.text(
+    #     0.01,
+    #     -0.22,
+    #     "Each box summarizes same-id token pairs: center line=median, box=IQR, whiskers=range without outliers.",
+    #     transform=ax.transAxes,
+    #     fontsize=8,
+    #     va="top",
+    # )
     fig.suptitle("")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "item_action_kv_similarity_boxplot.png"), dpi=160)
@@ -742,9 +959,9 @@ def _plot_kv_outputs(pair_df: pd.DataFrame, summary_df: pd.DataFrame, output_dir
                 marker="o",
                 label=token_type,
             )
-        ax.set_title("Layer-wise K cosine: action vs item")
+        ax.set_title("Layer-wise K CKSim: action vs item")
         ax.set_xlabel("Layer")
-        ax.set_ylabel("Mean K cosine")
+        ax.set_ylabel("Mean K CKSim")
         ax.grid(True, alpha=0.3)
         ax.legend()
         plt.tight_layout()
@@ -757,6 +974,11 @@ def _plot_kv_outputs(pair_df: pd.DataFrame, summary_df: pd.DataFrame, output_dir
             .mean()
             .reset_index()
         )
+        distance_summary["_distance_sort"] = distance_summary["distance_bucket"].map(
+            _distance_bucket_sort_key
+        )
+        distance_summary = distance_summary[distance_summary["token_type"] == "action"]
+        distance_summary = distance_summary.sort_values(["_distance_sort"])
         for token_type, group in distance_summary.groupby("token_type"):
             ax.plot(
                 group["distance_bucket"],
@@ -764,9 +986,9 @@ def _plot_kv_outputs(pair_df: pd.DataFrame, summary_df: pd.DataFrame, output_dir
                 marker="o",
                 label=token_type,
             )
-        ax.set_title("K cosine by position distance bucket")
+        ax.set_title("Action K CKSim by position distance bucket")
         ax.set_xlabel("Distance bucket")
-        ax.set_ylabel("Mean K cosine")
+        ax.set_ylabel("Mean K CKSim")
         ax.grid(True, alpha=0.3)
         ax.legend()
         plt.tight_layout()
@@ -878,7 +1100,8 @@ def run_kv_motivation_analysis(args) -> None:
         capture.records,
         window_size=args.kv_window_size,
         distance_buckets=args.kv_distance_buckets,
-        max_tokens_per_user=args.kv_max_actions_per_user,
+        max_items_per_user=args.kv_max_items_per_user,
+        max_actions_per_user=args.kv_max_actions_per_user,
         max_pairs_per_token_id=args.kv_max_pairs_per_token_id,
         max_pairs_per_distance_bucket=args.kv_max_pairs_per_distance_bucket,
     )
@@ -889,6 +1112,15 @@ def run_kv_motivation_analysis(args) -> None:
         max_actions_per_user=args.kv_max_actions_per_user,
         max_same_pairs_per_action_id=args.kv_max_pairs_per_token_id,
         max_different_pairs_per_user=args.kv_max_different_action_pairs_per_user,
+        max_pairs_per_distance_bucket=args.kv_max_pairs_per_distance_bucket,
+    )
+    random_token_df = _records_to_random_different_token_pair_frame(
+        capture.records,
+        window_size=args.kv_window_size,
+        distance_buckets=args.kv_distance_buckets,
+        max_items_per_user=args.kv_max_items_per_user,
+        max_actions_per_user=args.kv_max_actions_per_user,
+        max_pairs_per_user=args.kv_max_different_action_pairs_per_user,
         max_pairs_per_distance_bucket=args.kv_max_pairs_per_distance_bucket,
     )
     _write_pair_frame_for_debug(
@@ -911,7 +1143,16 @@ def run_kv_motivation_analysis(args) -> None:
         os.path.join(args.output_dir, "action_kv_same_vs_diff_distance_summary.csv"),
         index=False,
     )
-    _plot_action_same_diff_outputs(action_same_diff_df, args.output_dir)
+    identity_baseline_summary_df = _build_identity_baselines_by_layer_summary(
+        action_same_diff_df,
+        pair_df,
+        random_token_df,
+    )
+    identity_baseline_summary_df.to_csv(
+        os.path.join(args.output_dir, "kv_identity_baselines_by_layer_summary.csv"),
+        index=False,
+    )
+    _plot_identity_baselines_by_layer(identity_baseline_summary_df, args.output_dir)
 
     _write_pair_frame_for_debug(
         pair_df,
@@ -1192,7 +1433,8 @@ def _write_policy_grid_outputs(
     if by_task_rows:
         by_task = pd.concat(by_task_rows, ignore_index=True)
         by_task.to_csv(os.path.join(output_dir, f"{prefix}_auc_by_task.csv"), index=False)
-    _plot_policy_grid_auc(summary, output_dir, prefix)
+    if prefix != "layer_policy":
+        _plot_policy_grid_auc(summary, output_dir, prefix)
 
 
 def _read_and_annotate_policy_outputs(
@@ -1263,8 +1505,8 @@ def _plot_policy_grid_auc(summary: pd.DataFrame, output_dir: str, prefix: str) -
     fig, ax = plt.subplots(figsize=(8, 6))
     for top_k, group in summary.groupby("top_k"):
         ax.scatter(
-            group["reuse_ratio_all_tokens"],
             group["mean_reuse_auc"],
+            group["reuse_ratio_all_tokens"],
             s=45,
             label=f"K={int(top_k)}",
             alpha=0.8,
@@ -1272,16 +1514,16 @@ def _plot_policy_grid_auc(summary: pd.DataFrame, output_dir: str, prefix: str) -
     pareto = summary[summary["policy_pareto"]]
     if not pareto.empty:
         ax.scatter(
-            pareto["reuse_ratio_all_tokens"],
             pareto["mean_reuse_auc"],
+            pareto["reuse_ratio_all_tokens"],
             s=95,
             facecolors="none",
             edgecolors="black",
             linewidths=1.2,
             label="Pareto",
         )
-    ax.set_xlabel("Reuse ratio over all sequence tokens")
-    ax.set_ylabel("Mean filtered AUC")
+    ax.set_xlabel("Mean filtered AUC")
+    ax.set_ylabel("Reuse ratio over all sequence tokens")
     ax.set_title(prefix.replace("_", " ").title())
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -1290,8 +1532,99 @@ def _plot_policy_grid_auc(summary: pd.DataFrame, output_dir: str, prefix: str) -
     plt.close(fig)
 
 
+def _policy_point_from_run_name(run_name: str) -> Optional[Tuple[int, int]]:
+    match = re.fullmatch(r"w(\d+)_k(\d+)", run_name)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _layer_policy_point_from_run_name(run_name: str) -> Optional[Tuple[int, int, int]]:
+    match = re.fullmatch(r"layer(\d+)_w(\d+)_k(\d+)", run_name)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _copy_runs_source_to_output(source_dir: str, output_dir: str, dirname: str) -> str:
+    if not source_dir or not os.path.isdir(source_dir):
+        raise ValueError(f"{dirname} source directory does not exist: {source_dir}")
+    dest_dir = os.path.join(output_dir, dirname)
+    source_abs = os.path.abspath(source_dir)
+    dest_abs = os.path.abspath(dest_dir)
+    if source_abs == dest_abs:
+        return dest_dir
+    if os.path.exists(dest_dir):
+        shutil.rmtree(dest_dir)
+    shutil.copytree(source_dir, dest_dir)
+    return dest_dir
+
+
+def aggregate_policy_grid_auc_from_runs(args, mode: str) -> None:
+    rows: List[pd.DataFrame] = []
+    by_task_rows: List[pd.DataFrame] = []
+    if mode == "global":
+        run_root = _copy_runs_source_to_output(
+            args.policy_grid_runs_source_dir,
+            args.output_dir,
+            "policy_grid_runs",
+        )
+        parse_run_name = _policy_point_from_run_name
+    elif mode == "layer":
+        run_root = _copy_runs_source_to_output(
+            args.layer_policy_runs_source_dir,
+            args.output_dir,
+            "layer_policy_runs",
+        )
+        parse_run_name = _layer_policy_point_from_run_name
+    else:
+        raise ValueError("existing-run aggregation only supports global and layer policy grids.")
+
+    for run_name in sorted(os.listdir(run_root)):
+        point = parse_run_name(run_name)
+        if point is None:
+            continue
+        if mode == "global":
+            window_size, top_k = point
+            layer_idx = None
+        else:
+            layer_idx, window_size, top_k = point
+        run_dir = os.path.join(run_root, run_name)
+        if not os.path.isdir(run_dir):
+            continue
+        annotated_summary, annotated_by_task = _read_and_annotate_policy_outputs(
+            run_dir,
+            mode=mode,
+            window_size=window_size,
+            top_k=top_k,
+            layer_idx=layer_idx,
+        )
+        if annotated_summary is None:
+            continue
+        rows.append(annotated_summary)
+        if annotated_by_task is not None:
+            by_task_rows.append(annotated_by_task)
+
+    if not rows:
+        raise ValueError(f"No reusable {mode} policy outputs found in {run_root}")
+    _write_policy_grid_outputs(args.output_dir, mode, rows, by_task_rows)
+    _write_motivation_insights_markdown(
+        args.output_dir,
+        auc_summary=pd.DataFrame(),
+        eligible_metrics=[],
+        threshold=args.auc_filter_baseline_threshold,
+    )
+
+
 def run_policy_grid_auc_analysis(args, mode: str) -> None:
     """Run global/layer/user-bucket window-topK AUC grids and aggregate Pareto rows."""
+    if mode == "global" and getattr(args, "policy_grid_runs_source_dir", None):
+        aggregate_policy_grid_auc_from_runs(args, mode)
+        return
+    if mode == "layer" and getattr(args, "layer_policy_runs_source_dir", None):
+        aggregate_policy_grid_auc_from_runs(args, mode)
+        return
+
     if hasattr(base.gin, "clear_config"):
         base.gin.clear_config()
     base.gin.parse_config_file(args.gin_config_file)
@@ -1934,16 +2267,16 @@ def _append_policy_grid_section(
             lines.append("| " + " | ".join(values) + " |")
         lines.append("")
 
-    scatter = f"{prefix}_auc_reuse_scatter.png"
     lines.extend(
         [
             f"Full table: `{summary_file}`",
             f"All-task AUC table: `{by_task_file}`",
             f"Pareto table: `{pareto_file}`",
-            f"Scatter plot: `{scatter}`",
-            "",
         ]
     )
+    if prefix != "layer_policy":
+        lines.append(f"Scatter plot: `{prefix}_auc_reuse_scatter.png`")
+    lines.append("")
 
 
 def _write_motivation_insights_markdown(
@@ -2011,7 +2344,7 @@ def _write_motivation_insights_markdown(
                 "same action": "Both KV rows come from the same action id in the same user sequence.",
                 "different action": "The two KV rows come from different action ids in the same user sequence.",
                 "distance_bucket": "Interleaved-token distance between the two positions.",
-                "K/V Cosine": "Mean cosine similarity of projected K or V vectors.",
+                "K/V CKSim": "Mean head-wise cosine similarity of projected K or V vectors. Each head is compared along its feature dimension, then averaged across heads.",
                 "P10/P90": "10th/90th percentile; these expose tail behavior hidden by the mean.",
                 "pair_count": "Number of sampled pairs in this bucket.",
             },
@@ -2020,7 +2353,7 @@ def _write_motivation_insights_markdown(
             [
                 "Layer 0 is excluded here so the trend reflects contextual HSTU layers rather than raw embedding identity.",
                 "",
-                "| Pair Type | Distance Bucket | Mean Distance | K Cosine | K P10 | K P90 | K Centered | V Cosine | V P10 | V P90 | Pair Count |",
+                "| Pair Type | Distance Bucket | Mean Distance | K CKSim | K P10 | K P90 | K Centered CKSim | V CKSim | V P10 | V P90 | Pair Count |",
                 "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
@@ -2075,7 +2408,7 @@ def _write_motivation_insights_markdown(
                     "",
                     "Same-id action/item comparison, using the same distance buckets:",
                     "",
-                    "| Same-ID Token Type | Distance Bucket | K Cosine | K Centered | V Cosine | Pair Count |",
+                    "| Same-ID Token Type | Distance Bucket | K CKSim | K Centered CKSim | V CKSim | Pair Count |",
                     "|---|---:|---:|---:|---:|---:|",
                 ]
             )
@@ -2089,9 +2422,10 @@ def _write_motivation_insights_markdown(
         lines.extend(
             [
                 "Distribution plots:",
-                "- `action_kv_same_vs_diff_by_layer.png`",
-                "- `item_action_kv_similarity_boxplot.png`",
-                "- `item_vs_action_kv_similarity_by_distance.png`",
+                "- `action_kv_same_vs_diff_by_layer.png` (same action, different action, same item, and random different-token baselines)",
+                "- `kv_identity_baselines_by_layer_summary.csv`",
+                "- `item_action_kv_similarity_boxplot.png`: each group is same-id pairs split by token type and `same_window`. The center line is the median K CKSim, the box is the interquartile range, whiskers show the non-outlier range, and dots are outlier pairs. Higher boxes mean the same id keeps more similar K vectors across positions.",
+                "- `item_vs_action_kv_similarity_by_distance.png`: action-only same-id K CKSim by distance bucket, sorted from short to long distance.",
                 "",
             ]
         )
@@ -2197,5 +2531,6 @@ def _write_motivation_insights_markdown(
     report_text = "\n".join(lines) + "\n"
     with open(os.path.join(output_dir, "MOTIVATION_REPORT.md"), "w", encoding="utf-8") as f:
         f.write(report_text)
-    with open(os.path.join(output_dir, "MOTIVATION_INSIGHTS.md"), "w", encoding="utf-8") as f:
-        f.write(report_text)
+    insights_path = os.path.join(output_dir, "MOTIVATION_INSIGHTS.md")
+    if os.path.exists(insights_path):
+        os.remove(insights_path)

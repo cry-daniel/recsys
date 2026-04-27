@@ -37,6 +37,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shlex
 import sys
 from collections import Counter, defaultdict
@@ -161,10 +162,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--policy-grid-runs-source-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional existing policy_grid_runs directory to aggregate Q3 AUC/Pareto "
+            "outputs from. When set, --run-policy-grid-auc-analysis does not run "
+            "checkpoint inference."
+        ),
+    )
+    parser.add_argument(
         "--run-layer-policy-auc-analysis",
         action="store_true",
         help=(
             "Run per-layer AUC sensitivity for Q4. One layer is enabled per run."
+        ),
+    )
+    parser.add_argument(
+        "--layer-policy-runs-source-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional existing layer_policy_runs directory to aggregate Q4 AUC/Pareto "
+            "outputs from. When set, --run-layer-policy-auc-analysis does not run "
+            "checkpoint inference."
         ),
     )
     parser.add_argument(
@@ -201,6 +222,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-max-batches", type=int, default=3)
     parser.add_argument("--kv-max-users-per-batch", type=int, default=4)
     parser.add_argument("--kv-max-actions-per-user", type=int, default=64)
+    parser.add_argument(
+        "--kv-max-items-per-user",
+        type=int,
+        default=1024,
+        help=(
+            "Maximum item tokens sampled per user/layer for same-item KV baselines. "
+            "This is separate from --kv-max-actions-per-user because item repeats are much rarer."
+        ),
+    )
     parser.add_argument(
         "--kv-max-pairs-per-token-id",
         type=int,
@@ -354,10 +384,58 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+OBSOLETE_OUTPUT_FILES = (
+    "action_top1_extreme_users.png",
+    "global_vs_window_position_distance.png",
+    "global_vs_window_risk.csv",
+    "policy_by_user_length_bucket.png",
+    "policy_by_user_length_bucket.csv",
+    "reuse_savings_frontier.png",
+    "window_topk_candidate_rate_heatmap.png",
+    "MOTIVATION_INSIGHTS.md",
+    "layer_policy_auc_reuse_scatter.png",
+)
+
+
+def remove_obsolete_outputs(output_dir: str) -> None:
+    for name in OBSOLETE_OUTPUT_FILES:
+        path = os.path.join(output_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def current_report_command(args: argparse.Namespace) -> str:
     if args.report_command:
         return args.report_command
     return " ".join(shlex.quote(part) for part in [sys.executable, *sys.argv])
+
+
+def _sanitize_output_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value).strip()).strip("-") or "unknown"
+
+
+def _infer_task_type(args: argparse.Namespace) -> str:
+    candidates = [
+        getattr(args, "gin_config_file", None),
+        getattr(args, "ckpt_load_dir", None),
+    ]
+    text = " ".join(str(x).lower() for x in candidates if x)
+    if "retrieval" in text:
+        return "retrieval"
+    if "ranking" in text:
+        return "ranking"
+    return "ranking"
+
+
+def normalize_output_dir(args: argparse.Namespace) -> None:
+    output_dir = args.output_dir.rstrip(os.sep)
+    parent = os.path.dirname(output_dir)
+    basename = os.path.basename(output_dir)
+    if basename != "action_reuse_motivation_full":
+        return
+    dataset = _sanitize_output_part(args.dataset_name)
+    task_type = _sanitize_output_part(_infer_task_type(args))
+    args.output_dir = os.path.join(parent, f"{basename}_{dataset}_{task_type}")
 
 
 def record_report_command(args: argparse.Namespace, stage: str) -> None:
@@ -788,17 +866,6 @@ def plot_user_concentration(user_df: pd.DataFrame, output_dir: str, top_k_users:
     plt.savefig(os.path.join(output_dir, "action_topk_share_by_user.png"), dpi=160)
     plt.close(fig)
 
-    show_df = user_df.nlargest(top_k_users, "top1_share")
-    fig, ax = plt.subplots(figsize=(13, 5))
-    ax.bar(show_df["user_id"].astype(str), show_df["top1_share"], color="#4c78a8")
-    ax.set_title("Users with highest action top-1 share")
-    ax.set_xlabel("User ID")
-    ax.set_ylabel("Top-1 share")
-    ax.tick_params(axis="x", labelrotation=75)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "action_top1_extreme_users.png"), dpi=160)
-    plt.close(fig)
-
 
 def plot_policy_heatmap(policy_df: pd.DataFrame, output_dir: str, value_col: str, output_name: str) -> None:
     require_matplotlib()
@@ -970,6 +1037,7 @@ def save_summary(
 
 def run_data_analysis(args: argparse.Namespace) -> Tuple[str, str, str, List[UserSequence]]:
     ensure_dir(args.output_dir)
+    remove_obsolete_outputs(args.output_dir)
     record_report_command(args, "data_analysis")
     seq_file, item_feature_name, action_feature_name, users = load_user_sequences(
         args.dataset_name,
@@ -989,29 +1057,16 @@ def run_data_analysis(args: argparse.Namespace) -> Tuple[str, str, str, List[Use
         args.long_user_buckets,
         args.max_window_rows,
     )
-    risk_df = build_global_vs_window_risk_frame(
-        users, args.window_sizes, args.max_risk_pairs_per_user
-    )
+    risk_df = pd.DataFrame()
 
     user_df.to_csv(os.path.join(args.output_dir, "user_action_concentration.csv"), index=False)
     token_space_df.to_csv(os.path.join(args.output_dir, "token_space_summary.csv"), index=False)
     window_df.to_csv(os.path.join(args.output_dir, "window_action_concentration.csv"), index=False)
     policy_df.to_csv(os.path.join(args.output_dir, "reuse_policy_sweep.csv"), index=False)
-    bucket_df.to_csv(os.path.join(args.output_dir, "policy_by_user_length_bucket.csv"), index=False)
-    risk_df.to_csv(os.path.join(args.output_dir, "global_vs_window_risk.csv"), index=False)
 
     if not args.skip_plots:
         plot_user_concentration(user_df, args.output_dir, args.top_k_users)
         plot_policy_heatmap(policy_df, args.output_dir, "coverage", "window_topk_coverage_heatmap.png")
-        plot_policy_heatmap(
-            policy_df,
-            args.output_dir,
-            "candidate_rate",
-            "window_topk_candidate_rate_heatmap.png",
-        )
-        plot_reuse_frontier(policy_df, args.output_dir)
-        plot_user_bucket_policy(bucket_df, args.output_dir)
-        plot_global_vs_window_risk(risk_df, args.output_dir)
 
     save_summary(
         output_dir=args.output_dir,
@@ -1035,7 +1090,14 @@ def run_optional_kv_analysis(args: argparse.Namespace) -> None:
         or args.run_user_bucket_policy_auc_analysis
     ):
         return
-    if args.gin_config_file is None or args.ckpt_load_dir is None:
+    needs_checkpoint = (
+        args.run_kv_analysis
+        or args.run_auc_impact_analysis
+        or (args.run_layer_policy_auc_analysis and not args.layer_policy_runs_source_dir)
+        or args.run_user_bucket_policy_auc_analysis
+        or (args.run_policy_grid_auc_analysis and not args.policy_grid_runs_source_dir)
+    )
+    if needs_checkpoint and (args.gin_config_file is None or args.ckpt_load_dir is None):
         raise ValueError(
             "--run-kv-analysis/--run-auc-impact-analysis/--run-*-policy-auc-analysis "
             "requires --gin-config-file and --ckpt-load-dir"
@@ -1082,6 +1144,7 @@ def run_optional_kv_analysis(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    normalize_output_dir(args)
     seq_file, item_feature_name, action_feature_name, users = run_data_analysis(args)
     run_optional_kv_analysis(args)
     if not (

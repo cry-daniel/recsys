@@ -1,0 +1,101 @@
+{
+  "seq_file": "tmp_data//KuaiRand-1K/data/processed_seqs.csv",
+  "item_feature_name": "video_id",
+  "action_feature_name": "action_weights",
+  "num_users": 983,
+  "action_concentration": {
+    "mean_top1_share": 0.5866205175343809,
+    "median_top1_share": 0.5677600345274061,
+    "p95_top1_share": 0.8213887695305114,
+    "mean_top3_share": 0.9557601100348561,
+    "median_top3_share": 0.973883115130247,
+    "mean_hhi": 0.45025048294892067,
+    "mean_entropy": 1.5293773747056592
+  },
+  "token_space": [
+    {
+      "token_type": "item",
+      "num_users": 983,
+      "token_count": 11674485,
+      "global_unique_ids": 4363609,
+      "global_repeat_rate": 0.626226852833337,
+      "mean_user_unique_ids": 11536.751780264496,
+      "mean_user_unique_ratio": 0.9758955976666356,
+      "mean_user_top1_share": 0.0006299285667124607,
+      "mean_user_top2_share": 0.0011811103385429868,
+      "mean_user_top3_share": 0.0016864335447815547,
+      "mean_user_top4_share": 0.0021673458844277725,
+      "mean_user_top5_share": 0.002635276674485205
+    },
+    {
+      "token_type": "action",
+      "num_users": 983,
+      "token_count": 11674485,
+      "global_unique_ids": 125,
+      "global_repeat_rate": 0.9999892928895793,
+      "mean_user_unique_ids": 18.563580874872837,
+      "mean_user_unique_ratio": 0.003219406242550339,
+      "mean_user_top1_share": 0.5866205175343809,
+      "mean_user_top2_share": 0.8392884393435499,
+      "mean_user_top3_share": 0.9557601100348561,
+      "mean_user_top4_share": 0.9761288522120647,
+      "mean_user_top5_share": 0.9850838901838809
+    }
+  ],
+  "default_512_top3_policy": {
+    "window_size": 512.0,
+    "top_k": 3.0,
+    "num_users": 983.0,
+    "action_tokens": 11674485.0,
+    "selected_tokens": 11273385.0,
+    "candidate_tokens": 11135608.0,
+    "selected_action_types": 137777.0,
+    "unique_selected_refs": 137777.0,
+    "total_windows": 46085.0,
+    "eligible_windows": 46085.0,
+    "coverage": 0.9656430240820044,
+    "candidate_rate": 0.9538414756625239,
+    "kv_storage_reduction_est": 0.9538414756625239,
+    "mean_selected_action_types_per_window": 2.9896278615601606,
+    "mean_unique_actions_per_window": 5.956276445698166
+  },
+  "best_coverage_policy": [
+    {
+      "window_size": 64,
+      "top_k": 5,
+      "num_users": 983,
+      "action_tokens": 11674485,
+      "selected_tokens": 11630051,
+      "candidate_tokens": 10383610,
+      "selected_action_types": 1246441,
+      "unique_selected_refs": 1246441,
+      "total_windows": 365304,
+      "eligible_windows": 365304,
+      "coverage": 0.9961939220445271,
+      "candidate_rate": 0.8894276706852593,
+      "kv_storage_reduction_est": 0.8894276706852593,
+      "mean_selected_action_types_per_window": 3.4120650198191096,
+      "mean_unique_actions_per_window": 3.524798523969078
+    }
+  ],
+  "best_candidate_rate_policy": [
+    {
+      "window_size": 1024,
+      "top_k": 5,
+      "num_users": 983,
+      "action_tokens": 11674485,
+      "selected_tokens": 11557027,
+      "candidate_tokens": 11445865,
+      "selected_action_types": 111162,
+      "unique_selected_refs": 111162,
+      "total_windows": 23277,
+      "eligible_windows": 23277,
+      "coverage": 0.9899389137936278,
+      "candidate_rate": 0.9804171233249261,
+      "kv_storage_reduction_est": 0.9804171233249261,
+      "mean_selected_action_types_per_window": 4.77561541435752,
+      "mean_unique_actions_per_window": 7.331443055376552
+    }
+  ],
+  "global_vs_window_risk": []
+}

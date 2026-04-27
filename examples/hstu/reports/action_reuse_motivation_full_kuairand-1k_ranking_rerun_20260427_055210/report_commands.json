@@ -1,0 +1,27 @@
+[
+  {
+    "stage": "data_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name kuairand-1k --output-dir ./analysis_output/action_reuse_motivation_full_kuairand-1k_ranking_rerun_20260427_055210 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-policy-grid-auc-analysis --run-layer-policy-auc-analysis --gin-config-file ./training/configs/kuairand_1k_ranking.gin --ckpt-load-dir ckpt_kr_1k_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T05:52:12Z"
+  },
+  {
+    "stage": "policy_grid_auc_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name kuairand-1k --output-dir ./analysis_output/action_reuse_motivation_full_kuairand-1k_ranking_rerun_20260427_055210 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-policy-grid-auc-analysis --run-layer-policy-auc-analysis --gin-config-file ./training/configs/kuairand_1k_ranking.gin --ckpt-load-dir ckpt_kr_1k_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T05:52:41Z"
+  },
+  {
+    "stage": "layer_policy_auc_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name kuairand-1k --output-dir ./analysis_output/action_reuse_motivation_full_kuairand-1k_ranking_rerun_20260427_055210 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-policy-grid-auc-analysis --run-layer-policy-auc-analysis --gin-config-file ./training/configs/kuairand_1k_ranking.gin --ckpt-load-dir ckpt_kr_1k_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:17:03Z"
+  },
+  {
+    "stage": "data_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name kuairand-1k --output-dir ./analysis_output/action_reuse_motivation_full_kuairand-1k_ranking_rerun_20260427_055210 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-kv-analysis --gin-config-file ./training/configs/kuairand_1k_ranking.gin --ckpt-load-dir ckpt_kr_1k_ranking/iter1000 --kv-distance-buckets 64 128 256 512 1024 --kv-max-pairs-per-distance-bucket 5000 --max-raw-kv-pair-rows 1000 --auc-kv-replace-implementation kv_only --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:30:09Z"
+  },
+  {
+    "stage": "kv_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name kuairand-1k --output-dir ./analysis_output/action_reuse_motivation_full_kuairand-1k_ranking_rerun_20260427_055210 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-kv-analysis --gin-config-file ./training/configs/kuairand_1k_ranking.gin --ckpt-load-dir ckpt_kr_1k_ranking/iter1000 --kv-distance-buckets 64 128 256 512 1024 --kv-max-pairs-per-distance-bucket 5000 --max-raw-kv-pair-rows 1000 --auc-kv-replace-implementation kv_only --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:30:39Z"
+  }
+]

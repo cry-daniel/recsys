@@ -1,0 +1,37 @@
+[
+  {
+    "stage": "data_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-kv-analysis --run-policy-grid-auc-analysis --run-layer-policy-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --kv-distance-buckets 64 128 256 512 1024 --kv-max-pairs-per-distance-bucket 5000 --max-raw-kv-pair-rows 1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:39:52Z"
+  },
+  {
+    "stage": "kv_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-kv-analysis --run-policy-grid-auc-analysis --run-layer-policy-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --kv-distance-buckets 64 128 256 512 1024 --kv-max-pairs-per-distance-bucket 5000 --max-raw-kv-pair-rows 1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:40:55Z"
+  },
+  {
+    "stage": "policy_grid_auc_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-kv-analysis --run-policy-grid-auc-analysis --run-layer-policy-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --kv-distance-buckets 64 128 256 512 1024 --kv-max-pairs-per-distance-bucket 5000 --max-raw-kv-pair-rows 1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:47:32Z"
+  },
+  {
+    "stage": "data_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-policy-grid-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:48:17Z"
+  },
+  {
+    "stage": "policy_grid_auc_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-policy-grid-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T06:49:21Z"
+  },
+  {
+    "stage": "data_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-layer-policy-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T07:02:01Z"
+  },
+  {
+    "stage": "layer_policy_auc_analysis",
+    "command": "/usr/bin/python ./training/analyze_action_reuse_motivation.py --dataset-name ml-20m --output-dir ./analysis_output/action_reuse_motivation_full_ml-20m_ranking_rerun_20260427_063950 --max-window-rows 5000 --window-sizes 64 128 256 512 1024 --top-ks 1 2 3 4 5 --layer-window-sizes 1024 --layer-top-ks 1 --run-layer-policy-auc-analysis --gin-config-file ./training/configs/movielen_ranking.gin --ckpt-load-dir ckpt_ml_20m_ranking/iter1000 --auc-kv-replace-implementation kv_only --auc-max-eval-iters 10 --auc-filter-baseline-threshold 0.6",
+    "recorded_at_utc": "2026-04-27T07:03:08Z"
+  }
+]
