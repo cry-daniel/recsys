@@ -58,8 +58,11 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 import argparse
 import json
 import os
+import shlex
+import sys
 from collections import Counter
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple
 
 import commons.utils.initialize as init
@@ -84,6 +87,8 @@ from pipeline.train_pipeline import (
     JaggedMegatronTrainPipelineSparseDist,
 )
 from commons.checkpoint import get_unwrapped_module
+from modules.hstu_attention import create_hstu_attention
+from modules.jagged_data import JaggedData
 from trainer.training import evaluate, maybe_load_ckpts
 from trainer.utils import (
     create_dynamic_optitons_dict,
@@ -1544,33 +1549,43 @@ class KVCacheReplacer:
         reuse_token_type: str = "action",
         reuse_strategy: str = "window_topk_same_id",
         reuse_max_distance: Optional[int] = None,
+        replacement_impl: str = "hidden_proxy",
     ):
         if reuse_token_type not in {"action", "item", "both"}:
             raise ValueError("--kv-reuse-token-type must be one of: action, item, both")
         if reuse_strategy not in {
             "window_topk_same_id",
+            "window_topk_same_id_max_distance",
             "global_same_id",
             "global_topk_same_id",
             "wrong_id_same_window",
             "global_first_any_action_legacy",
             "same_id_max_distance",
+            "same_id_max_distance_no_chain",
         }:
             raise ValueError(
                 "--kv-reuse-strategy must be one of: window_topk_same_id, "
+                "window_topk_same_id_max_distance, "
                 "global_same_id, global_topk_same_id, wrong_id_same_window, "
-                "global_first_any_action_legacy, same_id_max_distance"
+                "global_first_any_action_legacy, same_id_max_distance, "
+                "same_id_max_distance_no_chain"
             )
+        if replacement_impl not in {"hidden_proxy", "kv_only"}:
+            raise ValueError("--kv-replace-implementation must be one of: hidden_proxy, kv_only")
         self.num_layers = num_layers
         self.reuse_policy = reuse_policy
         self.reuse_token_type = reuse_token_type
         self.reuse_strategy = reuse_strategy
         self.reuse_max_distance = reuse_max_distance
+        self.replacement_impl = replacement_impl
         self._planner = TokenKVReusePlanner(reuse_policy)
         self._selector = TokenWindowSelector()
         self._hooks = []
+        self._forward_overrides: List[Tuple[torch.nn.Module, Any]] = []
         self._current_action_ids: Optional[torch.Tensor] = None
         self._current_item_ids: Optional[torch.Tensor] = None
         self._legacy_first_hidden_by_layer: Dict[int, torch.Tensor] = {}
+        self._legacy_first_projected_kv_by_layer: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._enabled = False
         self._replacement_count = 0
         self._total_sequence_token_count = 0
@@ -1587,6 +1602,7 @@ class KVCacheReplacer:
         self._total_layer_sequence_token_count = 0
         self._total_layer_reuse_token_count = 0
         self._legacy_first_hidden_by_layer = {}
+        self._legacy_first_projected_kv_by_layer = {}
         self._layer_stats = {
             i: {
                 "total_windows": 0,
@@ -1603,7 +1619,7 @@ class KVCacheReplacer:
         }
 
     def register_hooks(self, model):
-        """Register forward pre-hooks for KV replacement."""
+        """Register layer interception for KV replacement."""
         from modules.native_hstu_layer import HSTULayer
         from modules.fused_hstu_layer import FusedHSTULayer
         from torch.nn.parallel import DistributedDataParallel
@@ -1651,9 +1667,14 @@ class KVCacheReplacer:
         layer_idx = 0
         for layer in hstu_block._attention_layers:
             layer_type = type(layer).__name__
-            print_rank_0(f"[KV Replace] Registering hook on layer {layer_idx}: {layer_type}")
+            print_rank_0(
+                f"[KV Replace] Registering {self.replacement_impl} interception "
+                f"on layer {layer_idx}: {layer_type}"
+            )
             
-            if isinstance(layer, FusedHSTULayer):
+            if self.replacement_impl == "kv_only":
+                self._register_kv_only_forward(layer, layer_idx)
+            elif isinstance(layer, FusedHSTULayer):
                 def make_hook(li):
                     def hook_fn(mod, args, kwargs):
                         return self._replace_kv_fused(mod, args, li)
@@ -1670,12 +1691,317 @@ class KVCacheReplacer:
             layer_idx += 1
         
         print_rank_0(f"[KV Replace] Total hooks registered: {len(self._hooks)}")
+        print_rank_0(f"[KV Replace] Total forward overrides registered: {len(self._forward_overrides)}")
 
     def remove_hooks(self):
-        """Remove all registered hooks."""
+        """Remove all registered hooks/forward overrides."""
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
+        for layer, original_forward in reversed(self._forward_overrides):
+            layer.forward = original_forward
+        self._forward_overrides.clear()
+
+    def _register_kv_only_forward(self, layer: torch.nn.Module, layer_idx: int) -> None:
+        """Override an HSTU layer forward so only projected K/V rows are reused."""
+        from modules.native_hstu_layer import HSTULayer
+        from modules.fused_hstu_layer import FusedHSTULayer
+
+        original_forward = layer.forward
+        self._forward_overrides.append((layer, original_forward))
+
+        if isinstance(layer, FusedHSTULayer):
+            attn_func = create_hstu_attention(
+                kernel_backend=layer._attn_backend,
+                num_heads=layer._num_heads,
+                attention_dim=layer._attention_dim_per_head,
+                linear_dim=layer._linear_dim_per_head,
+                is_causal=layer._is_causal,
+            )
+
+            def forward_kv_only(layer_self, jd):
+                if jd.values is None or not self._policy_has_any_positive_top_k():
+                    return original_forward(jd)
+                return self._forward_fused_kv_only(layer_self, jd, layer_idx, attn_func)
+
+            layer.forward = MethodType(forward_kv_only, layer)
+        elif isinstance(layer, HSTULayer):
+            def forward_kv_only(layer_self, jd):
+                if jd.values is None or not self._policy_has_any_positive_top_k():
+                    return original_forward(jd)
+                return self._forward_native_kv_only(layer_self, jd, layer_idx)
+
+            layer.forward = MethodType(forward_kv_only, layer)
+        else:
+            print_rank_0(
+                f"[KV Replace] WARNING: unsupported layer type for kv_only override: {type(layer)}"
+            )
+
+    def _policy_has_any_positive_top_k(self) -> bool:
+        policy = self._planner._policy
+        if policy.default.top_k > 0:
+            return True
+        for cfg in policy.layer_overrides.values():
+            if int(cfg.get("top_k", 0)) > 0:
+                return True
+        for bucket in policy.user_length_buckets:
+            if bucket.top_k is not None and int(bucket.top_k) > 0:
+                return True
+        return False
+
+    def _forward_fused_kv_only(self, layer, jd, layer_idx: int, attn_func) -> JaggedData:
+        x = jd.values
+        normed_x = self._fused_input_layer_norm(layer, x)
+        silu_uvqk = self._fused_addmm_silu(
+            x=normed_x,
+            w=layer._linear_uvqk_weight,
+            y=layer._linear_uvqk_bias,
+            silu=True,
+        )
+        user, value, query, key = torch.split(
+            silu_uvqk,
+            [
+                layer._linear_dim_per_head * layer._num_heads,
+                layer._linear_dim_per_head * layer._num_heads,
+                layer._attention_dim_per_head * layer._num_heads,
+                layer._attention_dim_per_head * layer._num_heads,
+            ],
+            dim=-1,
+        )
+        value = value.view(-1, layer._num_heads, layer._linear_dim_per_head)
+        query = query.view(-1, layer._num_heads, layer._attention_dim_per_head)
+        key = key.view(-1, layer._num_heads, layer._attention_dim_per_head)
+        key, value = self._apply_projected_kv_reuse(key, value, jd, layer_idx)
+        jagged_attn_output = self._fused_cutlass_attention(
+            layer=layer,
+            query=query,
+            key=key,
+            value=value,
+            jd=jd,
+            fallback_attn_func=attn_func,
+        )
+        parallel_input = self._fused_output_norm_mul_dropout(layer, jagged_attn_output, user)
+        residual = x if layer._residual else torch.zeros_like(x)
+        output = self._fused_addmm_silu(
+            x=parallel_input,
+            w=layer._linear_proj_weight,
+            y=residual,
+            silu=False,
+        )
+        return JaggedData(
+            values=output,
+            seqlen=jd.seqlen,
+            seqlen_offsets=jd.seqlen_offsets,
+            max_seqlen=jd.max_seqlen,
+            max_num_candidates=jd.max_num_candidates,
+            num_candidates=jd.num_candidates,
+            num_candidates_offsets=jd.num_candidates_offsets,
+            contextual_max_seqlen=jd.contextual_max_seqlen,
+            contextual_seqlen=jd.contextual_seqlen,
+            contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
+            has_interleaved_action=jd.has_interleaved_action,
+            scaling_seqlen=jd.scaling_seqlen,
+        )
+
+    @staticmethod
+    def _fused_sm_major() -> int:
+        return torch.cuda.get_device_properties(0).major
+
+    def _fused_addmm_silu(
+        self,
+        *,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        y: torch.Tensor,
+        silu: bool,
+    ) -> torch.Tensor:
+        sm_major = self._fused_sm_major()
+        if sm_major == 8:
+            from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
+
+            linear_out, silu_out = triton_addmm_silu_fwd(x=x, w=w, y=y, silu=silu)
+            return silu_out if silu else linear_out
+        if sm_major == 9:
+            from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
+
+            linear_out, silu_out = torch_addmm_silu_fwd(x=x, w=w, y=y, silu=silu)
+            return silu_out if silu else linear_out
+        return F.silu(torch.matmul(x, w) + y) if silu else torch.matmul(x, w) + y
+
+    @staticmethod
+    def _fused_input_layer_norm(layer, x: torch.Tensor) -> torch.Tensor:
+        from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
+
+        normed_x, _, _, _, _ = triton_weighted_layer_norm_fwd(
+            x=x,
+            weight=layer._input_layernorm_weight,
+            bias=layer._input_layernorm_bias,
+            eps=layer._eps,
+        )
+        return normed_x
+
+    def _fused_cutlass_attention(
+        self,
+        *,
+        layer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        jd,
+        fallback_attn_func,
+    ) -> torch.Tensor:
+        if layer._attn_backend.name != "CUTLASS":
+            return fallback_attn_func(
+                query,
+                key,
+                value,
+                jd.seqlen_offsets,
+                num_contextuals=jd.contextual_seqlen,
+                num_candidates=jd.num_candidates,
+                max_seqlen=jd.max_seqlen,
+                scaling_seqlen=jd.scaling_seqlen,
+                target_group_size=layer._target_group_size,
+            )
+
+        sm_major = self._fused_sm_major()
+        extension_args = ()
+        if sm_major == 8:
+            import hstu_attn_2_cuda as flash_attn_cuda_ampere
+
+            cutlass_hstu_varlen_fwd = flash_attn_cuda_ampere.varlen_fwd
+            extension_args = (None, None, None, None, None)
+        elif sm_major == 9:
+            import hstu_hopper_cuda as flash_attn_cuda_hopper
+
+            cutlass_hstu_varlen_fwd = flash_attn_cuda_hopper.varlen_fwd
+            extension_args = (-1, None, None, None, None, None, None, None, None)
+        else:
+            return fallback_attn_func(
+                query,
+                key,
+                value,
+                jd.seqlen_offsets,
+                num_contextuals=jd.contextual_seqlen,
+                num_candidates=jd.num_candidates,
+                max_seqlen=jd.max_seqlen,
+                scaling_seqlen=jd.scaling_seqlen,
+                target_group_size=layer._target_group_size,
+            )
+
+        num_contextuals = (
+            jd.contextual_seqlen.to(torch.int32)
+            if jd.contextual_seqlen is not None
+            else None
+        )
+        num_candidates = (
+            jd.num_candidates.to(torch.int32)
+            if isinstance(jd.num_candidates, torch.Tensor)
+            else None
+        )
+        attn_output, _ = cutlass_hstu_varlen_fwd(
+            query,
+            key,
+            value,
+            jd.seqlen_offsets.to(torch.int32),
+            jd.seqlen_offsets.to(torch.int32),
+            jd.max_seqlen,
+            jd.max_seqlen,
+            jd.scaling_seqlen,
+            num_contextuals,
+            num_candidates,
+            layer._target_group_size,
+            -1,
+            0,
+            layer._alpha,
+            None,
+            None,
+            *extension_args,
+        )
+        return attn_output[:, :, : layer._linear_dim_per_head].reshape(
+            -1,
+            layer._num_heads * layer._linear_dim_per_head,
+        )
+
+    @staticmethod
+    def _fused_output_norm_mul_dropout(layer, attn_output: torch.Tensor, user: torch.Tensor) -> torch.Tensor:
+        from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout_fwd
+
+        out, _, _, _, _, _ = triton_layer_norm_mul_dropout_fwd(
+            x=attn_output,
+            u=user,
+            weight=layer._output_layernorm_weight,
+            bias=layer._output_layernorm_bias,
+            eps=layer._eps,
+            dropout_ratio=layer._dropout_ratio,
+            training=layer.training,
+            concat_ux=False,
+            seed=layer._seed,
+        )
+        return out
+
+    def _forward_native_kv_only(self, layer, jd, layer_idx: int) -> JaggedData:
+        x = jd.values
+        normed_x = F.layer_norm(
+            x,
+            normalized_shape=[layer._embedding_dim],
+            weight=layer._input_layernorm_weight,
+            bias=layer._input_layernorm_bias,
+            eps=layer._eps,
+        )
+        tu, tv, tq, tk = layer.get_user_value_query_key_tensors(normed_x)
+        tk, tv = self._apply_projected_kv_reuse(tk, tv, jd, layer_idx)
+        jagged_attn_output = layer._attn_func(
+            tq,
+            tk,
+            tv,
+            jd.seqlen_offsets,
+            num_contextuals=jd.contextual_seqlen,
+            num_candidates=jd.num_candidates,
+            max_seqlen=jd.max_seqlen,
+            scaling_seqlen=jd.scaling_seqlen,
+            target_group_size=layer._target_group_size,
+        )
+        padding_length = getattr(jd, "padding_length", 0)
+        if padding_length > 0:
+            last_valid_index = jd.seqlen_offsets[-1]
+            jagged_attn_output = jagged_attn_output.clone()
+            jagged_attn_output[last_valid_index : last_valid_index + padding_length, ...] = 0.0
+
+        if layer._debug_shortcut_output_ln_mul_dropout:
+            parallel_input = jagged_attn_output
+        else:
+            parallel_input = layer._output_ln_dropout_mul(jagged_attn_output, tu)
+
+        if layer._debug_shortcut_proj_linear:
+            from ops.collective_ops import gather_along_last_dim, split_along_first_dim
+
+            output = gather_along_last_dim(
+                parallel_input, parallel_state.get_tensor_model_parallel_group()
+            )
+            if layer._sequence_parallel:
+                output = split_along_first_dim(
+                    output, parallel_state.get_tensor_model_parallel_group()
+                )
+        else:
+            output, _ = layer._linear_proj(parallel_input)
+
+        if layer._residual:
+            output = output + x
+        return JaggedData(
+            values=output,
+            seqlen=jd.seqlen,
+            seqlen_offsets=jd.seqlen_offsets,
+            padding_length=padding_length,
+            max_seqlen=jd.max_seqlen,
+            max_num_candidates=jd.max_num_candidates,
+            num_candidates=jd.num_candidates,
+            num_candidates_offsets=jd.num_candidates_offsets,
+            contextual_max_seqlen=jd.contextual_max_seqlen,
+            contextual_seqlen=jd.contextual_seqlen,
+            contextual_seqlen_offsets=jd.contextual_seqlen_offsets,
+            has_interleaved_action=jd.has_interleaved_action,
+            scaling_seqlen=jd.scaling_seqlen,
+        )
 
     def enable(self):
         """Enable KV replacement."""
@@ -1730,6 +2056,11 @@ class KVCacheReplacer:
         token_sources = self._active_token_sources()
         batch_size = len(seqlen_offsets) - 1
         token_offsets = {token_type: 0 for token_type, _ in token_sources}
+        original_hidden = (
+            hidden.detach().clone()
+            if self.reuse_strategy == "same_id_max_distance_no_chain"
+            else hidden
+        )
 
         with torch.no_grad():
             for user_idx in range(batch_size):
@@ -1764,12 +2095,157 @@ class KVCacheReplacer:
                     for plan in plans:
                         self._record_window_plan(layer_idx, plan)
                         for dst_abs, src_abs in plan.replacements:
-                            hidden[dst_abs].copy_(hidden[src_abs].detach())
+                            hidden[dst_abs].copy_(original_hidden[src_abs].detach())
                             self._replacement_count += 1
                             self._layer_stats[layer_idx]["replaced"] += 1
 
                     token_offsets[token_type] += token_count_for_user
         return None
+
+    def _apply_projected_kv_reuse(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        jd,
+        layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self._enabled:
+            return key, value
+        if not jd.has_interleaved_action:
+            return key, value
+        if self.reuse_strategy == "global_first_any_action_legacy":
+            return self._apply_legacy_first_any_action_projected(key, value, jd, layer_idx)
+
+        token_sources = self._active_token_sources()
+        seqlen_offsets = jd.seqlen_offsets
+        batch_size = len(seqlen_offsets) - 1
+        token_offsets = {token_type: 0 for token_type, _ in token_sources}
+        replaced_any = False
+        use_original_source = self.reuse_strategy == "same_id_max_distance_no_chain"
+        original_key = (
+            key.detach().clone()
+            if use_original_source
+            else key
+        )
+        original_value = (
+            value.detach().clone()
+            if use_original_source
+            else value
+        )
+
+        with torch.no_grad():
+            for user_idx in range(batch_size):
+                seq_start = int(seqlen_offsets[user_idx].item())
+                seq_end = int(seqlen_offsets[user_idx + 1].item())
+                seq_len = seq_end - seq_start
+                contextual_len = self._get_contextual_len(jd, user_idx)
+
+                counted_for_user = False
+                for token_type, token_ids in token_sources:
+                    token_count_for_user = self._planner.count_tokens(
+                        seq_len, contextual_len, token_type
+                    )
+                    plans, token_count, spec = self._build_plans(
+                        layer_idx=layer_idx,
+                        seq_start=seq_start,
+                        seq_len=seq_len,
+                        contextual_len=contextual_len,
+                        token_ids=token_ids,
+                        token_offset=token_offsets[token_type],
+                        token_type=token_type,
+                        hidden_size_0=key.shape[0],
+                    )
+                    self._record_user_policy(
+                        layer_idx,
+                        seq_len,
+                        token_count,
+                        spec,
+                        count_sequence_tokens=not counted_for_user,
+                    )
+                    counted_for_user = True
+                    for plan in plans:
+                        self._record_window_plan(layer_idx, plan)
+                        for dst_abs, src_abs in plan.replacements:
+                            if not replaced_any:
+                                key = key.clone()
+                                value = value.clone()
+                                replaced_any = True
+                            source_key = original_key if use_original_source else key
+                            source_value = original_value if use_original_source else value
+                            key[dst_abs].copy_(source_key[src_abs].detach())
+                            value[dst_abs].copy_(source_value[src_abs].detach())
+                            self._replacement_count += 1
+                            self._layer_stats[layer_idx]["replaced"] += 1
+
+                    token_offsets[token_type] += token_count_for_user
+        return key, value
+
+    def _apply_legacy_first_any_action_projected(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        jd,
+        layer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.reuse_token_type != "action":
+            return key, value
+
+        seqlen_offsets = jd.seqlen_offsets
+        batch_size = len(seqlen_offsets) - 1
+        replaced_any = False
+        with torch.no_grad():
+            for user_idx in range(batch_size):
+                seq_start = int(seqlen_offsets[user_idx].item())
+                seq_end = int(seqlen_offsets[user_idx + 1].item())
+                seq_len = seq_end - seq_start
+                contextual_len = self._get_contextual_len(jd, user_idx)
+                action_count = self._planner.count_tokens(seq_len, contextual_len, "action")
+                self._record_user_policy(
+                    layer_idx,
+                    seq_len,
+                    action_count,
+                    self._planner._policy.resolve(layer_idx, seq_len),
+                    count_sequence_tokens=True,
+                )
+                if action_count <= 1:
+                    continue
+
+                first_action_abs = seq_start + contextual_len + 1
+                if first_action_abs >= key.shape[0]:
+                    continue
+                if layer_idx not in self._legacy_first_projected_kv_by_layer:
+                    self._legacy_first_projected_kv_by_layer[layer_idx] = (
+                        key[first_action_abs].detach().clone(),
+                        value[first_action_abs].detach().clone(),
+                    )
+                first_key, first_value = self._legacy_first_projected_kv_by_layer[layer_idx]
+
+                replacements = []
+                action_item_span = max(0, seq_len - contextual_len)
+                for rel_pos in range(3, action_item_span, 2):
+                    action_abs = seq_start + contextual_len + rel_pos
+                    if action_abs >= key.shape[0]:
+                        break
+                    if not replaced_any:
+                        key = key.clone()
+                        value = value.clone()
+                        replaced_any = True
+                    key[action_abs].copy_(first_key)
+                    value[action_abs].copy_(first_value)
+                    replacements.append((action_abs, first_action_abs))
+                    self._replacement_count += 1
+                    self._layer_stats[layer_idx]["replaced"] += 1
+                if replacements:
+                    self._record_window_plan(
+                        layer_idx,
+                        WindowReusePlan(
+                            replacements=tuple(replacements),
+                            selected_token_types=1,
+                            candidate_tokens=len(replacements),
+                            has_tokens=True,
+                        ),
+                    )
+        return key, value
 
     def _replace_legacy_first_any_action(self, hidden: torch.Tensor, jd, layer_idx: int):
         """Reproduce the old threshold-sweep bad baseline.
@@ -1868,13 +2344,58 @@ class KVCacheReplacer:
         )
         if spec.top_k <= 0 or not tokens:
             return [], token_count, spec
+        if self.reuse_strategy == "window_topk_same_id_max_distance":
+            return self._build_window_topk_same_id_max_distance_plan(
+                tokens, token_count, spec, seq_len
+            ), token_count, spec
         if self.reuse_strategy == "global_same_id":
             return self._build_global_same_id_plan(tokens, token_count, spec), token_count, spec
         if self.reuse_strategy == "global_topk_same_id":
             return self._build_global_topk_same_id_plan(tokens, token_count, spec), token_count, spec
-        if self.reuse_strategy == "same_id_max_distance":
+        if self.reuse_strategy in {"same_id_max_distance", "same_id_max_distance_no_chain"}:
             return self._build_same_id_max_distance_plan(tokens, token_count, spec), token_count, spec
         return self._build_wrong_id_same_window_plan(tokens, token_count, spec, seq_len), token_count, spec
+
+    def _build_window_topk_same_id_max_distance_plan(
+        self,
+        tokens: List[TokenRef],
+        token_count: int,
+        spec: TokenKVReuseSpec,
+        seq_len: int,
+    ) -> List[WindowReusePlan]:
+        plans: List[WindowReusePlan] = []
+        max_distance = self.reuse_max_distance
+        for window_start in range(0, seq_len, spec.window_size):
+            window_end = min(seq_len, window_start + spec.window_size)
+            window_tokens = [
+                token for token in tokens if window_start <= token.local_pos < window_end
+            ]
+            if not window_tokens:
+                continue
+            selected_ids = set(self._selector.top_tokens(window_tokens, spec.top_k))
+            first_abs_by_token: Dict[int, int] = {}
+            replacements: List[Tuple[int, int]] = []
+            candidate_tokens = 0
+            for token in window_tokens:
+                if token.token_id not in selected_ids:
+                    continue
+                src_abs = first_abs_by_token.get(token.token_id)
+                if src_abs is None:
+                    first_abs_by_token[token.token_id] = token.abs_pos
+                    continue
+                distance = token.abs_pos - src_abs
+                if max_distance is None or max_distance < 0 or distance <= max_distance:
+                    candidate_tokens += 1
+                    replacements.append((token.abs_pos, src_abs))
+            plans.append(
+                WindowReusePlan(
+                    replacements=tuple(replacements),
+                    selected_token_types=len(selected_ids),
+                    candidate_tokens=candidate_tokens,
+                    has_tokens=True,
+                )
+            )
+        return plans
 
     def _build_global_same_id_plan(
         self,
@@ -2109,6 +2630,7 @@ class KVCacheReplacer:
             "reuse_token_type": self.reuse_token_type,
             "reuse_strategy": self.reuse_strategy,
             "reuse_max_distance": self.reuse_max_distance,
+            "replacement_impl": self.replacement_impl,
             "default_window_size": self.reuse_policy.default.window_size,
             "default_top_k": self.reuse_policy.default.top_k,
             "policy_json": self.reuse_policy.raw_policy_json,
@@ -2295,6 +2817,184 @@ def run_kv_diff_analysis(
     evaluate(pipeline, stateful_metric_module, trainer_args=trainer_args, eval_loader=eval_dataloader)
 
 
+def _mark_reuse_auc_pareto(summary: pd.DataFrame) -> List[bool]:
+    marks = []
+    for _, row in summary.iterrows():
+        dominated = False
+        for _, other in summary.iterrows():
+            if other["reuse_mode"] == row["reuse_mode"]:
+                continue
+            same_or_better = (
+                other["selected_ratio_all_tokens"] >= row["selected_ratio_all_tokens"]
+                and other["mean_kv_replaced"] >= row["mean_kv_replaced"]
+            )
+            strictly_better = (
+                other["selected_ratio_all_tokens"] > row["selected_ratio_all_tokens"]
+                or other["mean_kv_replaced"] > row["mean_kv_replaced"]
+            )
+            if same_or_better and strictly_better:
+                dominated = True
+                break
+        marks.append(not dominated)
+    return marks
+
+
+def _write_kv_replace_eval_markdown(
+    *,
+    output_dir: str,
+    comparison_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
+    auc_baseline_threshold: float = 0.6,
+    report_command: Optional[str] = None,
+) -> None:
+    auc_rows = comparison_df[
+        comparison_df["metric"].astype(str).str.upper().str.contains("AUC")
+    ].copy()
+    if auc_rows.empty:
+        return
+
+    eligible_metrics = (
+        auc_rows[auc_rows["baseline"] > auc_baseline_threshold]["metric"]
+        .drop_duplicates()
+        .tolist()
+    )
+    filtered = auc_rows[auc_rows["metric"].isin(eligible_metrics)] if eligible_metrics else auc_rows
+    group_cols = ["reuse_mode", "reuse_strategy", "reuse_token_type", "reuse_max_distance"]
+    filtered_summary = (
+        filtered.groupby(group_cols, dropna=False)
+        .agg(
+            filtered_task_count=("metric", "count"),
+            mean_baseline=("baseline", "mean"),
+            mean_kv_replaced=("kv_replaced", "mean"),
+            mean_diff=("diff", "mean"),
+            min_diff=("diff", "min"),
+            max_auc_drop=("diff", lambda x: float(max(0.0, -x.min()))),
+        )
+        .reset_index()
+    )
+    filtered_summary["reuse_max_distance"] = pd.to_numeric(
+        filtered_summary["reuse_max_distance"], errors="coerce"
+    )
+    stats_df = stats_df.copy()
+    stats_df["reuse_max_distance"] = pd.to_numeric(
+        stats_df["reuse_max_distance"], errors="coerce"
+    )
+    filtered_summary = filtered_summary.merge(
+        stats_df[
+            [
+                "reuse_mode",
+                "reuse_strategy",
+                "reuse_token_type",
+                "reuse_max_distance",
+                "replacement_count",
+                "selected_ratio_all_tokens",
+                "selected_ratio_all_reuse_tokens",
+                "replacement_impl",
+            ]
+        ],
+        on=group_cols,
+        how="left",
+    )
+    filtered_summary["pareto_optimal"] = _mark_reuse_auc_pareto(filtered_summary)
+    filtered_summary.to_csv(
+        os.path.join(output_dir, "reuse_auc_impact_summary_auc_gt_0p6.csv"),
+        index=False,
+    )
+
+    table = filtered_summary.sort_values(
+        ["pareto_optimal", "mean_kv_replaced", "selected_ratio_all_tokens"],
+        ascending=[False, False, False],
+    )
+    command = report_command or " ".join(shlex.quote(part) for part in [sys.executable, *sys.argv])
+    with open(os.path.join(output_dir, "report_commands.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            [
+                {
+                    "stage": "kv_replace_eval",
+                    "command": command,
+                }
+            ],
+            f,
+            indent=2,
+        )
+
+    lines = [
+        "# Action KV Reuse Evaluation Insights",
+        "",
+        f"- Filtered AUC tasks: {', '.join(eligible_metrics) if eligible_metrics else 'all AUC tasks'}",
+        f"- AUC threshold: baseline > {auc_baseline_threshold:.1f}",
+        f"- Implementation: {stats_df['replacement_impl'].dropna().iloc[0] if 'replacement_impl' in stats_df and not stats_df.empty else 'unknown'}",
+        "",
+        "## Reuse Ratio vs AUC",
+        "",
+        "Command:",
+        "",
+        "```bash",
+        command,
+        "```",
+        "",
+        "| Mode | Distance | Reuse Ratio | Mean AUC | Mean Diff | Max Drop | Replacements | Pareto |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for _, row in table.iterrows():
+        distance = row["reuse_max_distance"]
+        if pd.isna(distance):
+            distance_str = "-"
+        elif int(distance) < 0:
+            distance_str = "global"
+        else:
+            distance_str = str(int(distance))
+        lines.append(
+            "| "
+            f"{row['reuse_mode']} | "
+            f"{distance_str} | "
+            f"{row['selected_ratio_all_tokens'] * 100:.2f}% | "
+            f"{row['mean_kv_replaced']:.6f} | "
+            f"{row['mean_diff']:+.6f} | "
+            f"{row['max_auc_drop']:.6f} | "
+            f"{int(row['replacement_count']) if not pd.isna(row['replacement_count']) else 0:,} | "
+            f"{'yes' if bool(row['pareto_optimal']) else 'no'} |"
+        )
+
+    bad = table.sort_values("max_auc_drop", ascending=False).head(2)
+    semantic_good = table[
+        table["reuse_strategy"].isin(
+            [
+                "window_topk_same_id",
+                "window_topk_same_id_max_distance",
+                "same_id_max_distance",
+                "same_id_max_distance_no_chain",
+                "global_topk_same_id",
+                "global_same_id",
+            ]
+        )
+    ]
+    good = semantic_good.sort_values(
+        ["mean_kv_replaced", "selected_ratio_all_tokens"], ascending=[False, False]
+    ).head(2)
+    lines.extend(["", "## Takeaways", ""])
+    if not bad.empty:
+        worst = bad.iloc[0]
+        lines.append(
+            f"- Aggressive or semantically wrong reuse is the negative control: "
+            f"`{worst['reuse_mode']}` reaches {worst['selected_ratio_all_tokens'] * 100:.2f}% reuse "
+            f"but has max AUC drop {worst['max_auc_drop']:.6f}."
+        )
+    if not good.empty:
+        best = good.iloc[0]
+        lines.append(
+            f"- Constrained same-action reuse is the useful regime: "
+            f"`{best['reuse_mode']}` reaches {best['selected_ratio_all_tokens'] * 100:.2f}% reuse "
+            f"with mean AUC diff {best['mean_diff']:+.6f}."
+        )
+    lines.append(
+        "- The evaluation is now KV-only: source rows are copied after UVQK projection, so Q/U remain position-specific."
+    )
+
+    with open(os.path.join(output_dir, "KV_REUSE_EVAL_INSIGHTS.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def run_kv_replace_analysis(
     model_train,
     model,
@@ -2307,6 +3007,9 @@ def run_kv_replace_analysis(
     reuse_token_types: List[str],
     reuse_strategies: List[str],
     reuse_max_distances: Optional[List[int]] = None,
+    replacement_impl: str = "hidden_proxy",
+    report_command: Optional[str] = None,
+    baseline_metrics_override: Optional[Dict[str, float]] = None,
 ):
     """Run KV Cache replacement analysis."""
     print_rank_0("=== Running KV Cache Replacement Analysis ===")
@@ -2322,6 +3025,7 @@ def run_kv_replace_analysis(
     print_rank_0(f"KV reuse token modes: {reuse_token_types}")
     print_rank_0(f"KV reuse strategies: {reuse_strategies}")
     print_rank_0(f"KV reuse max distances: {reuse_max_distances or ['default']}")
+    print_rank_0(f"KV replacement implementation: {replacement_impl}")
 
     unwrapped = get_unwrapped_module(model)
     hstu_config = unwrapped._hstu_config
@@ -2336,50 +3040,6 @@ def run_kv_replace_analysis(
     )
     pipeline._model.eval()
 
-    # First, run baseline evaluation (no replacement) - collect logits/labels
-    print_rank_0("\n--- Baseline Evaluation (No KV Replacement) ---")
-
-    # Use pipeline progress for baseline evaluation
-    from itertools import islice
-    requested_eval_iters = trainer_args.max_eval_iters if trainer_args.max_eval_iters is not None else 10
-    max_batches = min(requested_eval_iters, len(eval_dataloader))
-    iterated_eval_loader = islice(eval_dataloader, len(eval_dataloader))
-    
-    all_logits = []
-    all_labels = []
-    batch_count = 0
-
-    with torch.no_grad():
-        for i in range(max_batches):
-            try:
-                reporting_loss, (local_loss, logits, labels, seqlen_info) = pipeline.progress(iterated_eval_loader)
-                all_logits.append(logits.detach().cpu())
-                all_labels.append(labels.detach().cpu())
-                batch_count += 1
-            except StopIteration:
-                break
-
-    # Compute baseline metrics - keep tensors on CUDA device for distributed sync
-    if all_logits and all_labels:
-        all_logits_baseline = torch.cat(all_logits, dim=0).to(device)
-        all_labels_baseline = torch.cat(all_labels, dim=0).to(device)
-
-        # Use the metric module to compute baseline
-        stateful_metric_module(all_logits_baseline, all_labels_baseline)
-        if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
-            retrieval_gr = get_unwrapped_module(pipeline._model)
-            export_table_name = retrieval_gr.get_item_feature_table_name()
-            baseline_metrics, _, _ = stateful_metric_module.compute(
-                *retrieval_gr._embedding_collection.export_local_embedding(export_table_name)
-            )
-        else:
-            baseline_metrics = stateful_metric_module.compute()
-        print_rank_0(f"Baseline metrics: {baseline_metrics}")
-    else:
-        print_rank_0("No baseline data collected.")
-        return
-
-    # Now run with KV replacement
     def _reset_metric_module() -> None:
         reset_found = False
         if hasattr(stateful_metric_module, 'reset'):
@@ -2416,6 +3076,63 @@ def run_kv_replace_analysis(
                     elif isinstance(val, torch.Tensor):
                         setattr(stateful_metric_module, attr_name, [])
 
+    # Use pipeline progress for evaluation.
+    from itertools import islice
+    requested_eval_iters = (
+        trainer_args.max_eval_iters
+        if trainer_args.max_eval_iters is not None
+        else len(eval_dataloader)
+    )
+    max_batches = min(requested_eval_iters, len(eval_dataloader))
+
+    if baseline_metrics_override is not None:
+        baseline_metrics = {
+            key: torch.tensor(float(value), device=device)
+            for key, value in baseline_metrics_override.items()
+        }
+        print_rank_0("\n--- Baseline Evaluation (No KV Replacement) ---")
+        print_rank_0(f"Baseline metrics reused from cache: {baseline_metrics}")
+    else:
+        # First, run baseline evaluation (no replacement) - collect logits/labels.
+        print_rank_0("\n--- Baseline Evaluation (No KV Replacement) ---")
+        _reset_metric_module()
+        iterated_eval_loader = islice(eval_dataloader, len(eval_dataloader))
+
+        all_logits = []
+        all_labels = []
+        batch_count = 0
+
+        with torch.no_grad():
+            for i in range(max_batches):
+                try:
+                    reporting_loss, (local_loss, logits, labels, seqlen_info) = pipeline.progress(iterated_eval_loader)
+                    all_logits.append(logits.detach().cpu())
+                    all_labels.append(labels.detach().cpu())
+                    batch_count += 1
+                except StopIteration:
+                    break
+
+        # Compute baseline metrics - keep tensors on CUDA device for distributed sync
+        if all_logits and all_labels:
+            all_logits_baseline = torch.cat(all_logits, dim=0).to(device)
+            all_labels_baseline = torch.cat(all_labels, dim=0).to(device)
+
+            # Use the metric module to compute baseline
+            stateful_metric_module(all_logits_baseline, all_labels_baseline)
+            if isinstance(stateful_metric_module, RetrievalTaskMetricWithSampling):
+                retrieval_gr = get_unwrapped_module(pipeline._model)
+                export_table_name = retrieval_gr.get_item_feature_table_name()
+                baseline_metrics, _, _ = stateful_metric_module.compute(
+                    *retrieval_gr._embedding_collection.export_local_embedding(export_table_name)
+                )
+            else:
+                baseline_metrics = stateful_metric_module.compute()
+            print_rank_0(f"Baseline metrics: {baseline_metrics}")
+        else:
+            print_rank_0("No baseline data collected.")
+            return
+
+    # Now run with KV replacement
     class _TokenAwareEvalIter:
         """Iterator wrapper that feeds current batch item/action IDs to replacer."""
 
@@ -2515,7 +3232,13 @@ def run_kv_replace_analysis(
     for reuse_strategy in reuse_strategies:
         strategy_distances = (
             reuse_max_distances
-            if reuse_strategy == "same_id_max_distance" and reuse_max_distances
+            if reuse_strategy
+            in {
+                "same_id_max_distance",
+                "same_id_max_distance_no_chain",
+                "window_topk_same_id_max_distance",
+            }
+            and reuse_max_distances
             else [None]
         )
         for reuse_token_type in reuse_token_types:
@@ -2541,6 +3264,7 @@ def run_kv_replace_analysis(
                     reuse_token_type=reuse_token_type,
                     reuse_strategy=reuse_strategy,
                     reuse_max_distance=reuse_max_distance,
+                    replacement_impl=replacement_impl,
                 )
                 replacer.register_hooks(model_train)
                 replacer.enable()
@@ -2683,6 +3407,7 @@ def run_kv_replace_analysis(
                     "reuse_strategy": stats["reuse_strategy"],
                     "reuse_token_type": stats["reuse_token_type"],
                     "reuse_max_distance": stats["reuse_max_distance"],
+                    "replacement_impl": stats["replacement_impl"],
                     "default_window_size": stats["default_window_size"],
                     "default_top_k": stats["default_top_k"],
                     "policy_json": stats["policy_json"],
@@ -2748,6 +3473,12 @@ def run_kv_replace_analysis(
         )
         if all_overall_stats_rows:
             stats_df = pd.DataFrame(all_overall_stats_rows)
+            summary_df["reuse_max_distance"] = pd.to_numeric(
+                summary_df["reuse_max_distance"], errors="coerce"
+            )
+            stats_df["reuse_max_distance"] = pd.to_numeric(
+                stats_df["reuse_max_distance"], errors="coerce"
+            )
             summary_df = summary_df.merge(
                 stats_df[
                     [
@@ -2768,6 +3499,13 @@ def run_kv_replace_analysis(
                 how="left",
             )
             stats_df.to_csv(os.path.join(output_dir, "kv_replace_overall_stats_all_modes.csv"), index=False)
+            _write_kv_replace_eval_markdown(
+                output_dir=output_dir,
+                comparison_df=comparison_df,
+                stats_df=stats_df,
+                auc_baseline_threshold=0.6,
+                report_command=report_command,
+            )
         summary_df.to_csv(os.path.join(output_dir, "reuse_auc_impact_summary.csv"), index=False)
         print_rank_0(
             f"Saved AUC impact summary to {os.path.join(output_dir, 'reuse_auc_impact_summary.csv')}"
@@ -2790,10 +3528,29 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./analysis_output",
                         help="Directory to save analysis results")
     parser.add_argument(
+        "--report-command",
+        type=str,
+        default=None,
+        help=(
+            "Optional exact shell command to embed in generated markdown reports. "
+            "If omitted, the script records a reconstructed python command."
+        ),
+    )
+    parser.add_argument(
         "--kv-replace-sim-threshold",
         type=float,
         default=0.90,
         help="Deprecated for kv_cache_replace: ignored by window/top-K action KV reuse.",
+    )
+    parser.add_argument(
+        "--kv-replace-implementation",
+        type=str,
+        default="hidden_proxy",
+        choices=["hidden_proxy", "kv_only"],
+        help=(
+            "For kv_cache_replace: hidden_proxy copies layer inputs before UVQK; "
+            "kv_only copies only projected K/V rows and keeps Q/U unchanged."
+        ),
     )
     parser.add_argument(
         "--kv-reuse-window-size",
@@ -2840,11 +3597,13 @@ def main():
         default="window_topk_same_id",
         choices=[
             "window_topk_same_id",
+            "window_topk_same_id_max_distance",
             "global_same_id",
             "global_topk_same_id",
             "wrong_id_same_window",
             "global_first_any_action_legacy",
             "same_id_max_distance",
+            "same_id_max_distance_no_chain",
         ],
         help="For kv_cache_replace: how source positions are selected for KV reuse.",
     )
@@ -2855,11 +3614,13 @@ def main():
         default=None,
         choices=[
             "window_topk_same_id",
+            "window_topk_same_id_max_distance",
             "global_same_id",
             "global_topk_same_id",
             "wrong_id_same_window",
             "global_first_any_action_legacy",
             "same_id_max_distance",
+            "same_id_max_distance_no_chain",
         ],
         help="For kv_cache_replace motivation sweeps: run multiple reuse strategies.",
     )
@@ -2918,7 +3679,8 @@ def main():
             f"top_k={reuse_policy.default.top_k}, "
             f"token_modes={reuse_token_types}, "
             f"strategies={reuse_strategies}, "
-            f"max_distances={args.kv_reuse_max_distances}"
+            f"max_distances={args.kv_reuse_max_distances}, "
+            f"implementation={args.kv_replace_implementation}"
         )
         print_rank_0(
             "KV replace similarity threshold is deprecated and ignored: "
@@ -3017,6 +3779,8 @@ def main():
             args.kv_reuse_token_types or [args.kv_reuse_token_type],
             args.kv_reuse_strategies or [args.kv_reuse_strategy],
             args.kv_reuse_max_distances,
+            args.kv_replace_implementation,
+            args.report_command,
         )
 
     init.destroy_global_state()
